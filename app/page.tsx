@@ -65,16 +65,23 @@ function useNowMs(): number {
   return now;
 }
 
-/** One-off check of whether this deployment has demo click-to-call configured at all. */
-function useDemoCallConfigured(): boolean {
-  const [configured, setConfigured] = useState(false);
+/** One-off check of demo click-to-call availability and the configured ScamSink number. */
+function useDemoStatus(): { demoCallConfigured: boolean; scamSinkNumber: string | null } {
+  const [demoCallConfigured, setDemoCallConfigured] = useState(false);
+  const [scamSinkNumber, setScamSinkNumber] = useState<string | null>(null);
   useEffect(() => {
     fetch("/api/status", { cache: "no-store" })
       .then((res) => (res.ok ? res.json() : null))
-      .then((data) => setConfigured(Boolean(data?.demoCallConfigured)))
-      .catch(() => setConfigured(false));
+      .then((data) => {
+        setDemoCallConfigured(Boolean(data?.demoCallConfigured));
+        setScamSinkNumber(typeof data?.scamSinkNumber === "string" ? data.scamSinkNumber : null);
+      })
+      .catch(() => {
+        setDemoCallConfigured(false);
+        setScamSinkNumber(null);
+      });
   }, []);
-  return configured;
+  return { demoCallConfigured, scamSinkNumber };
 }
 
 type DemoCallState =
@@ -400,7 +407,7 @@ function FailureBanner({ title, detail }: { title: string; detail: string }) {
 export default function DashboardPage() {
   const state = useDashboardState();
   const nowMs = useNowMs();
-  const demoCallConfigured = useDemoCallConfigured();
+  const { demoCallConfigured, scamSinkNumber } = useDemoStatus();
   const { state: demoState, startDemoCall } = useDemoCall();
 
   let statusNode: React.ReactNode = <StatusPill label="CONNECTING" tone="ended" />;
@@ -430,7 +437,7 @@ export default function DashboardPage() {
       statusNode = <StatusPill label="READY" tone="ready" />;
       body = (
         <IdleView
-          scamSinkNumber={null}
+          scamSinkNumber={scamSinkNumber}
           demoCallConfigured={demoCallConfigured}
           demoState={demoState}
           onStartDemoCall={startDemoCall}
