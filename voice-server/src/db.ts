@@ -26,15 +26,19 @@ async function queryOne<T extends QueryResultRow = QueryResultRow>(
 }
 
 export type CallStatus = "ringing" | "active" | "completed" | "failed";
+export type CallDirection = "inbound" | "outbound_demo";
 export type Speaker = "caller" | "scamsink" | "system";
 
 export interface CallLookup {
   id: string;
   status: CallStatus;
+  direction: CallDirection;
 }
 
 export async function getCallByTwilioSid(twilioCallSid: string): Promise<CallLookup | null> {
-  return queryOne<CallLookup>(`select id, status from calls where twilio_call_sid = $1`, [twilioCallSid]);
+  return queryOne<CallLookup>(`select id, status, direction from calls where twilio_call_sid = $1`, [
+    twilioCallSid,
+  ]);
 }
 
 /** Idempotent: safe to call repeatedly for the same call. */

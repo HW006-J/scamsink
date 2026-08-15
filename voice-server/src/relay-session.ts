@@ -8,6 +8,12 @@ import {
 } from "./db.js";
 import { redactSensitiveNumbers } from "./redact.js";
 import { AIProviderError, boundHistory, type AIProvider, type ConversationTurn } from "./ai/index.js";
+import {
+  advanceDemoScript,
+  DEMO_SCRIPT_FALLBACK_LINE,
+  INITIAL_DEMO_SCRIPT_STATE,
+  type DemoScriptState,
+} from "./demoScript.js";
 
 const FALLBACK_LINE =
   "Sorry, I'm having a bit of trouble hearing you right now. I'll have to call you back.";
@@ -33,6 +39,11 @@ export class RelaySession {
   private history: ConversationTurn[] = [];
   private closed = false;
   private generation = 0;
+  // Outbound demo calls follow a deterministic comedy script instead of
+  // free-form Groq replies, decided once at setup from the call's
+  // direction and never changed mid-call.
+  private demoScriptMode = false;
+  private scriptState: DemoScriptState = INITIAL_DEMO_SCRIPT_STATE;
 
   constructor(
     private readonly ws: WebSocket,
@@ -100,6 +111,7 @@ export class RelaySession {
     }
 
     this.callId = call.id;
+    this.demoScriptMode = call.direction === "outbound_demo";
     await Promise.all([
       markCallActive(message.callSid),
       recordCallEvent(call.id, "voice_server_connected"),
@@ -117,6 +129,12 @@ export class RelaySession {
     );
 
     const generation = this.generation;
+
+    if (this.demoScriptMode) {
+      await this.handleScriptedPrompt(redacted, generation);
+      return;
+    }
+
     let fullReply = "";
 
     try {
@@ -154,6 +172,43 @@ export class RelaySession {
           console.error("[relay] failed to persist scamsink transcript", err),
         );
       }
+    }
+  }
+
+  /**
+   * Deterministic reply path for outbound demo calls. advanceDemoScript is
+   * synchronous and pure — there is no network call here that can hang or
+   * fail — but this is still wrapped defensively so that even a bug in the
+   * state machine can never result in silence: `line` is always set to
+   * either a scripted line or the fixed fallback, and a reply is always
+   * sent (respecting the same interrupt/close checks as the dynamic path).
+   */
+  private async handleScriptedPrompt(callerText: string, generation: number): Promise<void> {
+    let line: string;
+    try {
+      const result = advanceDemoScript(this.scriptState, callerText);
+      this.scriptState = result.nextState;
+      line = result.line;
+      if (this.callId) {
+        await recordCallEvent(this.callId, "demo_script_turn", {
+          fromIndex: result.transition.fromIndex,
+          toIndex: result.transition.toIndex,
+          matched: result.transition.matched,
+        }).catch(() => {});
+      }
+    } catch (err) {
+      console.error("[relay] demo script state machine failed, using safe fallback:", err);
+      line = DEMO_SCRIPT_FALLBACK_LINE;
+    }
+
+    if (this.closed || generation !== this.generation) return;
+
+    this.send({ type: "text", token: line, last: true });
+
+    if (this.callId) {
+      await appendTranscriptMessage(this.callId, "scamsink", line).catch((err) =>
+        console.error("[relay] failed to persist scamsink transcript", err),
+      );
     }
   }
 
