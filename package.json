@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "pretypecheck": "next typegen",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:migrate": "node --env-file-if-exists=.env.local --env-file-if-exists=.env scripts/migrate.mjs"

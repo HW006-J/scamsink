@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Separate deployable project with its own lint/typecheck — not part of
+    // this tsconfig's program (see tsconfig.json's "exclude").
+    "voice-server/**",
   ]),
 ]);
 
