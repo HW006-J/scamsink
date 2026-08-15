@@ -126,9 +126,15 @@ export class RelaySession {
       });
     } catch (err) {
       const detail = err instanceof AIProviderError ? err.message : String(err);
-      console.error("[relay] AI provider failed:", detail);
+      // The cause is the underlying SDK error (e.g. "401 Invalid API Key",
+      // "model_not_found") — safe to log: provider SDKs don't echo the API
+      // key back in error messages, and this is what actually explains a
+      // failure beyond the generic wrapper message.
+      const cause =
+        err instanceof AIProviderError && err.cause instanceof Error ? err.cause.message : undefined;
+      console.error("[relay] AI provider failed:", detail, cause ? `(cause: ${cause})` : "");
       if (this.callId) {
-        await recordCallEvent(this.callId, "ai_provider_error", { message: detail }).catch(() => {});
+        await recordCallEvent(this.callId, "ai_provider_error", { message: detail, cause }).catch(() => {});
       }
       if (!this.closed && generation === this.generation) {
         this.send({ type: "text", token: FALLBACK_LINE, last: true });
