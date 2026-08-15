@@ -14,6 +14,11 @@ const serverEnvSchema = z.object({
   PUBLIC_APP_URL: z.string().url("PUBLIC_APP_URL must be a valid URL"),
   VOICE_SERVER_URL: z.string().min(1, "VOICE_SERVER_URL is required"),
   VOICE_SERVER_SHARED_SECRET: z.string().min(16, "VOICE_SERVER_SHARED_SECRET must be at least 16 characters"),
+  // Hackathon demo mode: lets an operator trigger an outbound call from the
+  // dashboard instead of waiting for a real inbound scam call. Optional —
+  // only required if the /api/demo/start-call route is actually used.
+  DEMO_PHONE_NUMBER: z.string().min(1).optional(),
+  DEMO_OPERATOR_SECRET: z.string().min(8).optional(),
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;

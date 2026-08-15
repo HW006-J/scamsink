@@ -5,6 +5,11 @@ import { formatDurationLong, formatDurationShort, formatTimerClock } from "@/lib
 import type { DashboardState } from "@/lib/types";
 
 const POLL_INTERVAL_MS = 1000;
+// Mirrors lib/demoAuth.ts's DEMO_SECRET_HEADER — kept as a plain literal here
+// (rather than importing that module) so this client component never pulls
+// server-only code (node:crypto) into the browser bundle.
+const DEMO_SECRET_HEADER = "x-demo-operator-secret";
+const DEMO_SECRET_STORAGE_KEY = "scamsink_demo_operator_secret";
 
 type FetchState =
   | { kind: "connecting" }
@@ -60,15 +65,88 @@ function useNowMs(): number {
   return now;
 }
 
-function StatusPill({ label, tone }: { label: string; tone: "ready" | "live" | "ended" | "error" }) {
-  const toneClasses: Record<typeof tone, string> = {
+/** One-off check of whether this deployment has demo click-to-call configured at all. */
+function useDemoCallConfigured(): boolean {
+  const [configured, setConfigured] = useState(false);
+  useEffect(() => {
+    fetch("/api/status", { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => setConfigured(Boolean(data?.demoCallConfigured)))
+      .catch(() => setConfigured(false));
+  }, []);
+  return configured;
+}
+
+type DemoCallState =
+  | { kind: "idle" }
+  | { kind: "starting" }
+  | { kind: "error"; message: string };
+
+/**
+ * Drives the "START DEMO CALL" button. The operator passphrase is prompted
+ * for once and cached in sessionStorage — never shipped in the JS bundle,
+ * never sent anywhere except as a header on this one request.
+ */
+function useDemoCall() {
+  const [state, setState] = useState<DemoCallState>({ kind: "idle" });
+
+  const startDemoCall = useCallback(async () => {
+    let secret = window.sessionStorage.getItem(DEMO_SECRET_STORAGE_KEY);
+    if (!secret) {
+      secret = window.prompt("Operator passphrase to start the demo call:");
+      if (!secret) return;
+      window.sessionStorage.setItem(DEMO_SECRET_STORAGE_KEY, secret);
+    }
+
+    setState({ kind: "starting" });
+    try {
+      const res = await fetch("/api/demo/start-call", {
+        method: "POST",
+        headers: { [DEMO_SECRET_HEADER]: secret },
+      });
+
+      if (res.status === 401) {
+        window.sessionStorage.removeItem(DEMO_SECRET_STORAGE_KEY);
+        setState({ kind: "error", message: "Wrong operator passphrase — try again." });
+        return;
+      }
+      if (res.status === 409) {
+        setState({ kind: "error", message: "A call is already ringing or in progress." });
+        return;
+      }
+      if (res.status === 501) {
+        setState({ kind: "error", message: "Demo call mode isn't configured on this deployment." });
+        return;
+      }
+      if (!res.ok) {
+        setState({ kind: "error", message: "Twilio could not start the call." });
+        return;
+      }
+
+      // Success: the next dashboard-state poll will pick up the new
+      // ringing call within ~1s and replace this transient state.
+      setState({ kind: "idle" });
+    } catch {
+      setState({ kind: "error", message: "Could not reach ScamSink. Check your connection." });
+    }
+  }, []);
+
+  return { state, startDemoCall };
+}
+
+type StatusTone = "ready" | "ringing" | "live" | "ended" | "error";
+
+function StatusPill({ label, tone }: { label: string; tone: StatusTone }) {
+  const toneClasses: Record<StatusTone, string> = {
     ready: "text-accent-green",
+    ringing: "text-accent-red",
     live: "text-accent-red",
     ended: "text-muted",
     error: "text-accent-red",
   };
-  const dotClasses: Record<typeof tone, string> = {
+  const dotClasses: Record<StatusTone, string> = {
     ready: "bg-accent-green",
+    ringing: "bg-accent-red pulse-dot",
     live: "bg-accent-red pulse-dot",
     ended: "bg-muted",
     error: "bg-accent-red pulse-dot",
@@ -157,7 +235,18 @@ function TranscriptPanel({ transcript }: { transcript: DashboardState["transcrip
   );
 }
 
-function IdleView({ scamSinkNumber }: { scamSinkNumber: string | null }) {
+function IdleView({
+  scamSinkNumber,
+  demoCallConfigured,
+  demoState,
+  onStartDemoCall,
+}: {
+  scamSinkNumber: string | null;
+  demoCallConfigured: boolean;
+  demoState: DemoCallState;
+  onStartDemoCall: () => void;
+}) {
+  const starting = demoState.kind === "starting";
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-10 px-8 py-16 text-center">
       <div>
@@ -170,7 +259,32 @@ function IdleView({ scamSinkNumber }: { scamSinkNumber: string | null }) {
         <p className="mt-1 font-mono text-xl">{scamSinkNumber ?? "Not configured"}</p>
       </div>
       <p className="text-sm text-muted">No active call.</p>
+
+      {demoCallConfigured && (
+        <div className="flex flex-col items-center gap-2">
+          <button
+            type="button"
+            onClick={onStartDemoCall}
+            disabled={starting}
+            className="rounded-md border border-accent-red bg-accent-red/10 px-6 py-3 text-sm font-semibold uppercase tracking-wide text-accent-red transition hover:bg-accent-red/20 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {starting ? "Starting call…" : "Start demo call"}
+          </button>
+          <p className="text-xs text-muted">Ring the configured demo phone and start a live ScamSink session.</p>
+          {demoState.kind === "error" && (
+            <p className="text-xs text-accent-red">{demoState.message}</p>
+          )}
+        </div>
+      )}
     </div>
+  );
+}
+
+function DemoBadge() {
+  return (
+    <span className="rounded border border-border-subtle px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
+      Demo call
+    </span>
   );
 }
 
@@ -193,6 +307,11 @@ function LiveView({ data, nowMs }: { data: DashboardState; nowMs: number }) {
           <div>
             <p className="text-xs uppercase tracking-[0.2em] text-muted">Caller</p>
             <p className="mt-1 font-mono text-lg">{call.callerNumberMasked ?? "Unknown"}</p>
+            {call.direction === "outbound_demo" && (
+              <div className="mt-1 flex justify-end">
+                <DemoBadge />
+              </div>
+            )}
           </div>
           <div>
             <p className="text-xs uppercase tracking-[0.2em] text-muted">Status</p>
@@ -237,6 +356,11 @@ function CompletedView({ data }: { data: DashboardState }) {
         <div>
           <p className="text-xs uppercase tracking-[0.2em] text-muted">Caller</p>
           <p className="mt-1 font-mono">{call.callerNumberMasked ?? "Unknown"}</p>
+          {call.direction === "outbound_demo" && (
+            <div className="mt-1">
+              <DemoBadge />
+            </div>
+          )}
         </div>
         <div>
           <p className="text-xs uppercase tracking-[0.2em] text-muted">Started</p>
@@ -276,6 +400,8 @@ function FailureBanner({ title, detail }: { title: string; detail: string }) {
 export default function DashboardPage() {
   const state = useDashboardState();
   const nowMs = useNowMs();
+  const demoCallConfigured = useDemoCallConfigured();
+  const { state: demoState, startDemoCall } = useDemoCall();
 
   let statusNode: React.ReactNode = <StatusPill label="CONNECTING" tone="ended" />;
   let body: React.ReactNode = null;
@@ -302,8 +428,18 @@ export default function DashboardPage() {
     const { call } = state.data;
     if (!call) {
       statusNode = <StatusPill label="READY" tone="ready" />;
-      body = <IdleView scamSinkNumber={null} />;
-    } else if (call.status === "ringing" || call.status === "active") {
+      body = (
+        <IdleView
+          scamSinkNumber={null}
+          demoCallConfigured={demoCallConfigured}
+          demoState={demoState}
+          onStartDemoCall={startDemoCall}
+        />
+      );
+    } else if (call.status === "ringing") {
+      statusNode = <StatusPill label="RINGING" tone="ringing" />;
+      body = <LiveView data={state.data} nowMs={nowMs} />;
+    } else if (call.status === "active") {
       statusNode = <StatusPill label="LIVE" tone="live" />;
       body = <LiveView data={state.data} nowMs={nowMs} />;
     } else {

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { createCall } from "@/lib/calls";
+import { createCall, getCallByTwilioSid } from "@/lib/calls";
 import { getServerEnv } from "@/lib/env";
 import { maskPhoneNumber } from "@/lib/mask";
 import { PERSONA_DEFAULT } from "@/lib/types";
@@ -35,17 +35,26 @@ export async function POST(request: Request) {
   }
 
   const callSid = params.CallSid;
-  const from = params.From;
   if (!callSid) {
     return new NextResponse("Bad Request", { status: 400 });
   }
 
   try {
-    await createCall({
-      twilioCallSid: callSid,
-      callerNumberMasked: maskPhoneNumber(from),
-      persona: PERSONA_DEFAULT,
-    });
+    // Demo (outbound) calls already have their row created by
+    // /api/demo/start-call, with the correct direction and masked demo
+    // number — don't let this webhook clobber that. Real inbound calls hit
+    // this route first, so this is where their row gets created.
+    const existing = await getCallByTwilioSid(callSid);
+    if (!existing) {
+      const isInbound = params.Direction === "inbound";
+      const counterpartyNumber = isInbound ? params.From : params.To;
+      await createCall({
+        twilioCallSid: callSid,
+        callerNumberMasked: maskPhoneNumber(counterpartyNumber),
+        persona: PERSONA_DEFAULT,
+        direction: isInbound ? "inbound" : "outbound_demo",
+      });
+    }
   } catch (error) {
     console.error("[twilio/voice] failed to create call record", error);
     // Fail the call cleanly rather than connecting a relay with no DB row behind it.

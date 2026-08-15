@@ -1,19 +1,24 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
-const { createCallMock, readVerifiedTwilioRequestMock, InvalidTwilioSignatureError } = vi.hoisted(() => {
-  class InvalidTwilioSignatureError extends Error {}
-  return {
-    createCallMock: vi.fn(),
-    readVerifiedTwilioRequestMock: vi.fn(),
-    InvalidTwilioSignatureError,
-  };
-});
+const { createCallMock, getCallByTwilioSidMock, readVerifiedTwilioRequestMock, InvalidTwilioSignatureError } =
+  vi.hoisted(() => {
+    class InvalidTwilioSignatureError extends Error {}
+    return {
+      createCallMock: vi.fn(),
+      getCallByTwilioSidMock: vi.fn(),
+      readVerifiedTwilioRequestMock: vi.fn(),
+      InvalidTwilioSignatureError,
+    };
+  });
 
 vi.mock("@/lib/twilioAuth", () => ({
   InvalidTwilioSignatureError,
   readVerifiedTwilioRequest: readVerifiedTwilioRequestMock,
 }));
-vi.mock("@/lib/calls", () => ({ createCall: createCallMock }));
+vi.mock("@/lib/calls", () => ({
+  createCall: createCallMock,
+  getCallByTwilioSid: getCallByTwilioSidMock,
+}));
 vi.mock("@/lib/env", () => ({
   getServerEnv: () => ({
     VOICE_SERVER_URL: "wss://voice.example.com/relay",
@@ -33,7 +38,8 @@ function makeRequest(body: string): Request {
 
 describe("POST /api/twilio/voice", () => {
   beforeEach(() => {
-    createCallMock.mockReset();
+    createCallMock.mockReset().mockResolvedValue({ id: "call-id-1" });
+    getCallByTwilioSidMock.mockReset().mockResolvedValue(null);
     readVerifiedTwilioRequestMock.mockReset();
   });
 
@@ -87,5 +93,52 @@ describe("POST /api/twilio/voice", () => {
     expect(res.status).toBe(200);
     expect(xml).toContain("<Hangup");
     expect(xml).not.toContain("ConversationRelay");
+  });
+
+  it("infers direction=inbound and masks From for a genuine inbound call", async () => {
+    readVerifiedTwilioRequestMock.mockResolvedValue({
+      CallSid: "CAxxxx",
+      From: "+15551234567",
+      To: "+12184293208",
+      Direction: "inbound",
+    });
+
+    await POST(makeRequest("CallSid=CAxxxx"));
+
+    expect(createCallMock).toHaveBeenCalledWith(
+      expect.objectContaining({ direction: "inbound" }),
+    );
+  });
+
+  it("infers direction=outbound_demo and uses To (the callee) when Direction is not inbound", async () => {
+    readVerifiedTwilioRequestMock.mockResolvedValue({
+      CallSid: "CAoutbound",
+      From: "+12184293208",
+      To: "+447700900000",
+      Direction: "outbound-api",
+    });
+
+    await POST(makeRequest("CallSid=CAoutbound"));
+
+    expect(createCallMock).toHaveBeenCalledWith(
+      expect.objectContaining({ direction: "outbound_demo" }),
+    );
+  });
+
+  it("does not re-create (and cannot clobber) a call row already created by /api/demo/start-call", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({ id: "existing-call-id", status: "ringing" });
+    readVerifiedTwilioRequestMock.mockResolvedValue({
+      CallSid: "CAoutbound",
+      From: "+12184293208",
+      To: "+447700900000",
+      Direction: "outbound-api",
+    });
+
+    const res = await POST(makeRequest("CallSid=CAoutbound"));
+    const xml = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(xml).toContain("<ConversationRelay");
+    expect(createCallMock).not.toHaveBeenCalled();
   });
 });

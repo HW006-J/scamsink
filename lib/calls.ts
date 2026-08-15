@@ -1,5 +1,5 @@
 import { query, queryOne } from "./db";
-import type { CallStatus, DashboardState, Speaker } from "./types";
+import type { CallDirection, CallStatus, DashboardState, Speaker } from "./types";
 
 export interface CallLookup {
   id: string;
@@ -13,24 +13,34 @@ export async function getCallByTwilioSid(twilioCallSid: string): Promise<CallLoo
   );
 }
 
+/** Any call not yet completed/failed — used to stop a second demo call from being started concurrently. */
+export async function getActiveCall(): Promise<CallLookup | null> {
+  return queryOne<CallLookup>(
+    `select id, status from calls where status in ('ringing', 'active') order by created_at desc limit 1`,
+  );
+}
+
 interface CreateCallInput {
   twilioCallSid: string;
   callerNumberMasked: string | null;
   persona: string;
+  direction?: CallDirection;
 }
 
 /**
  * Idempotent: Twilio can retry the voice webhook for the same CallSid, so
- * this upserts rather than erroring on the unique constraint.
+ * this upserts rather than erroring on the unique constraint. The update
+ * branch intentionally leaves `direction` alone — it's set once at creation
+ * (by whichever route sees the CallSid first) and never flips afterward.
  */
 export async function createCall(input: CreateCallInput): Promise<{ id: string }> {
   const row = await queryOne<{ id: string }>(
-    `insert into calls (twilio_call_sid, status, caller_number_masked, persona)
-     values ($1, 'ringing', $2, $3)
+    `insert into calls (twilio_call_sid, status, caller_number_masked, persona, direction)
+     values ($1, 'ringing', $2, $3, $4)
      on conflict (twilio_call_sid)
      do update set caller_number_masked = excluded.caller_number_masked
      returning id`,
-    [input.twilioCallSid, input.callerNumberMasked, input.persona],
+    [input.twilioCallSid, input.callerNumberMasked, input.persona, input.direction ?? "inbound"],
   );
   if (!row) throw new Error("Failed to create call record");
   return row;
@@ -93,6 +103,7 @@ interface CallRow {
   id: string;
   twilio_call_sid: string;
   status: CallStatus;
+  direction: CallDirection;
   caller_number_masked: string | null;
   started_at: Date | null;
   ended_at: Date | null;
@@ -118,7 +129,7 @@ function toIso(value: Date | null): string | null {
  */
 export async function getDashboardState(): Promise<DashboardState> {
   const call = await queryOne<CallRow>(
-    `select id, twilio_call_sid, status, caller_number_masked, started_at, ended_at, duration_seconds, persona
+    `select id, twilio_call_sid, status, direction, caller_number_masked, started_at, ended_at, duration_seconds, persona
      from calls
      order by created_at desc
      limit 1`
@@ -140,6 +151,7 @@ export async function getDashboardState(): Promise<DashboardState> {
     call: {
       id: call.id,
       status: call.status,
+      direction: call.direction,
       callerNumberMasked: call.caller_number_masked,
       startedAt: toIso(call.started_at),
       endedAt: toIso(call.ended_at),
