@@ -16,22 +16,17 @@ import {
 } from "./demoScript.js";
 import {
   advanceInfraScript,
+  INFRA_OPENING_LINE,
   INFRA_SAFE_FALLBACK_LINE,
   INITIAL_INFRA_SCRIPT_STATE,
   type InfraScriptState,
 } from "./infraScript.js";
+import { estimateProactiveDelayMs } from "./ttsTiming.js";
 
 type ScriptMode = "none" | "scam_honeypot" | "infrastructure_simulation";
 
 const FALLBACK_LINE =
   "Sorry, I'm having a bit of trouble hearing you right now. I'll have to call you back.";
-
-// ConversationRelay doesn't expose a documented silence/no-input timeout
-// event (checked against Twilio's own reference: the only turn-boundary
-// controls are speechTimeout/eotThreshold, which govern when an in-progress
-// utterance is finalized, not "the human hasn't said anything at all"), so
-// infrastructure-simulation calls track this themselves with a plain timer.
-const SILENCE_TIMEOUT_MS = 7_000;
 
 interface TwilioInboundMessage {
   type: string;
@@ -130,29 +125,40 @@ export class RelaySession {
     }
   }
 
-  /** Infrastructure-simulation only. Always cancels any existing timer first, so at most one is ever pending. */
-  private scheduleSilenceTimer(): void {
+  /**
+   * Infrastructure-simulation only. Delay is estimated from `justSpokenLine`
+   * — not a flat constant — so the window scales with how long that
+   * specific line actually takes to speak (see ttsTiming.ts): estimated
+   * playback time, THEN a genuine human-response grace period, only after
+   * which a proactive continuation may fire. Always cancels any existing
+   * timer first, so at most one is ever pending.
+   */
+  private scheduleSilenceTimer(justSpokenLine: string): void {
     if (this.closed || this.scriptMode !== "infrastructure_simulation") return;
     this.clearSilenceTimer();
     const token = this.silenceToken;
+    const delayMs = estimateProactiveDelayMs(justSpokenLine);
     this.silenceTimer = setTimeout(() => {
       this.handleSilenceTimeout(token).catch((err) => console.error("[relay] silence timeout handling error", err));
-    }, SILENCE_TIMEOUT_MS);
+    }, delayMs);
   }
 
   /**
-   * Fires after SILENCE_TIMEOUT_MS with no real caller activity. Treated as
-   * an empty utterance through the exact same infra-script path a real
-   * "vague/unintelligible" turn would take — advanceInfraScript already
-   * classifies empty text as OTHER and continues the narrative, so this
-   * reuses fully-tested logic rather than inventing a separate mechanism.
+   * Fires once estimated playback + the human-response grace period has
+   * elapsed with no real caller activity. Treated as an empty utterance
+   * through the exact same infra-script path a real "vague/unintelligible"
+   * turn would take — advanceInfraScript already classifies empty text as
+   * OTHER and continues the narrative, so this reuses fully-tested logic
+   * rather than inventing a separate mechanism. Rescheduling the NEXT
+   * timer happens inside handleInfraScriptedPrompt itself, estimated from
+   * whatever line this proactive turn just spoke — so a silent call gets
+   * naturally spaced beats, never back-to-back TTS.
    */
   private async handleSilenceTimeout(token: number): Promise<void> {
     this.silenceTimer = null;
     if (this.closed || token !== this.silenceToken) return; // real activity happened since this was scheduled
     const generation = this.generation;
     await this.handleInfraScriptedPrompt("", generation);
-    this.scheduleSilenceTimer();
   }
 
   private async handleSetup(message: TwilioInboundMessage): Promise<void> {
@@ -182,8 +188,12 @@ export class RelaySession {
           : "scam_honeypot"
         : "none";
     // Start waiting for either a reply or silence — ScamSink carries the
-    // conversation forward on its own if the human doesn't respond.
-    this.scheduleSilenceTimer();
+    // conversation forward on its own if the human doesn't respond. The
+    // opening line itself was just spoken via TwiML welcomeGreeting (see
+    // app/api/twilio/voice/route.ts), so estimate ITS playback time too.
+    if (this.scriptMode === "infrastructure_simulation") {
+      this.scheduleSilenceTimer(INFRA_OPENING_LINE);
+    }
     await Promise.all([
       markCallActive(message.callSid),
       recordCallEvent(call.id, "voice_server_connected"),
@@ -208,7 +218,6 @@ export class RelaySession {
     }
     if (this.scriptMode === "infrastructure_simulation") {
       await this.handleInfraScriptedPrompt(redacted, generation);
-      this.scheduleSilenceTimer();
       return;
     }
 
@@ -318,6 +327,10 @@ export class RelaySession {
     if (this.closed || generation !== this.generation) return;
 
     this.send({ type: "text", token: line, last: true });
+    // Reschedule from HERE, not from when this method was invoked — this
+    // is what makes the window scale with THIS line's own estimated
+    // playback time, whether the turn was reactive or proactive.
+    this.scheduleSilenceTimer(line);
 
     if (this.callId) {
       await appendTranscriptMessage(this.callId, "scamsink", line).catch((err) =>

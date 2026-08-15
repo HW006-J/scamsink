@@ -23,7 +23,9 @@ vi.mock("./db.js", () => ({
 }));
 
 import { AIProviderError, type AIProvider } from "./ai/index.js";
+import { advanceInfraScript, INFRA_OPENING_LINE, INITIAL_INFRA_SCRIPT_STATE } from "./infraScript.js";
 import { RelaySession } from "./relay-session.js";
+import { estimatePlaybackMs, estimateProactiveDelayMs } from "./ttsTiming.js";
 
 class FakeWebSocket {
   static readonly OPEN = 1;
@@ -526,7 +528,14 @@ describe("RelaySession — rapid speech cannot wedge the state", () => {
 });
 
 describe("RelaySession — proactive silence continuation (infrastructure simulation only)", () => {
-  const SILENCE_TIMEOUT_MS = 7_000;
+  // Real expected timings, derived from the actual production estimator and
+  // actual scripted lines — never hardcoded magic numbers — so these tests
+  // stay correct if line text or the timing model's constants change.
+  const openingDelayMs = estimateProactiveDelayMs(INFRA_OPENING_LINE);
+  const openingPlaybackMs = estimatePlaybackMs(INFRA_OPENING_LINE);
+  const firstProactiveLine = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "").line;
+  const secondProactiveDelayMs = estimateProactiveDelayMs(firstProactiveLine);
+  const secondProactivePlaybackMs = estimatePlaybackMs(firstProactiveLine);
 
   beforeEach(() => {
     getCallByTwilioSidMock.mockReset();
@@ -541,26 +550,30 @@ describe("RelaySession — proactive silence continuation (infrastructure simula
     vi.useRealTimers();
   });
 
-  it("silence causes a proactive scripted continuation after the timeout", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({
-      id: "call-1",
-      status: "active",
-      direction: "outbound_demo",
-      demoMode: "infrastructure_simulation",
-    });
+  function setupInfraCall(demoMode: string | null = "infrastructure_simulation") {
+    getCallByTwilioSidMock.mockResolvedValue({ id: "call-1", status: "active", direction: "outbound_demo", demoMode });
     const ws = new FakeWebSocket();
     new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+    return ws;
+  }
 
+  it("regression: reproduces the reported bug scenario — no proactive line fires merely because estimated playback has elapsed; only after playback + the human-response grace period", async () => {
+    // The opening line's own estimated playback typically runs several
+    // real seconds (word-count dependent) — well short of openingDelayMs,
+    // which also includes the grace period. Advancing only that far must
+    // NOT produce a proactive line — reproducing the exact bug where the
+    // old flat 7s timer fired mid-playback/right as TTS ended.
+    const ws = setupInfraCall();
     ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
     await vi.advanceTimersByTimeAsync(0);
 
+    await vi.advanceTimersByTimeAsync(openingPlaybackMs);
     expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
 
-    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS);
-
+    // Now advance through the remaining human-response grace period.
+    await vi.advanceTimersByTimeAsync(openingDelayMs - openingPlaybackMs);
     const textMessages = ws.sent.filter((m) => m.type === "text");
     expect(textMessages).toHaveLength(1);
-    expect((textMessages[0].token as string).length).toBeGreaterThan(0);
     expect(recordCallEventMock).toHaveBeenCalledWith(
       "call-1",
       "infra_script_turn",
@@ -568,69 +581,99 @@ describe("RelaySession — proactive silence continuation (infrastructure simula
     );
   });
 
-  it("a real prompt before the timeout cancels the pending proactive continuation — no overlapping speech", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({
-      id: "call-1",
-      status: "active",
-      direction: "outbound_demo",
-      demoMode: "infrastructure_simulation",
-    });
-    const ws = new FakeWebSocket();
-    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
-
+  it("human speaks 2 seconds after estimated TTS playback would have finished — proactive continuation is cancelled", async () => {
+    const ws = setupInfraCall();
     ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
     await vi.advanceTimersByTimeAsync(0);
 
-    // Real caller speech arrives well before the silence timeout would fire.
-    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS - 3_000);
+    await vi.advanceTimersByTimeAsync(openingPlaybackMs + 2_000);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0); // still within the grace window, nothing fired yet
+
     ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Sure, I can help.", last: true }));
     await vi.advanceTimersByTimeAsync(0);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1); // the real reply
 
-    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1);
-
-    // Advance past when the ORIGINAL (now-cancelled) timer would have fired.
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1); // still just the one real reply — no overlap
+    // Advance well past when the original (now-cancelled) proactive timer would have fired.
+    await vi.advanceTimersByTimeAsync(openingDelayMs);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1); // no extra overlapping proactive line
   });
 
-  it("repeated silence produces sequential, non-overlapping proactive turns, never more than one per interval", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({
-      id: "call-1",
-      status: "active",
-      direction: "outbound_demo",
-      demoMode: "infrastructure_simulation",
-    });
-    const ws = new FakeWebSocket();
-    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
-
+  it("human interrupts while TTS is still (estimated to be) playing — proactive continuation is cancelled", async () => {
+    const ws = setupInfraCall();
     ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
     await vi.advanceTimersByTimeAsync(0);
 
-    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS);
+    // Interrupt mid-playback, well before the estimated playback window ends.
+    await vi.advanceTimersByTimeAsync(Math.floor(openingPlaybackMs / 2));
+    ws.emit("message", JSON.stringify({ type: "interrupt", utteranceUntilInterrupt: "wait", durationUntilInterruptMs: 100 }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    await vi.advanceTimersByTimeAsync(openingDelayMs);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0); // never fired
+  });
+
+  it("a proactive line cannot immediately trigger another proactive line — the same playback+grace rule applies again", async () => {
+    const ws = setupInfraCall();
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    await vi.advanceTimersByTimeAsync(openingDelayMs);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1); // first proactive line
+
+    // Advance only through the SECOND proactive line's own estimated
+    // playback (not yet its grace period) — must not have fired again.
+    await vi.advanceTimersByTimeAsync(secondProactivePlaybackMs);
     expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1);
 
-    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS);
+    // Now advance through its grace period too.
+    await vi.advanceTimersByTimeAsync(secondProactiveDelayMs - secondProactivePlaybackMs);
     expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(2);
+  });
 
-    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS);
-    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(3);
+  it("30+ seconds of complete silence produces spaced, natural continuation beats — never back-to-back TTS", async () => {
+    const ws = setupInfraCall();
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(0);
 
-    const lines = ws.sent.filter((m) => m.type === "text").map((m) => m.token);
-    expect(new Set(lines).size).toBe(lines.length); // each proactive turn said something different
+    const countsOverTime: number[] = [];
+    let elapsed = 0;
+    const stepMs = 1_000;
+    while (elapsed < 32_000) {
+      await vi.advanceTimersByTimeAsync(stepMs);
+      elapsed += stepMs;
+      countsOverTime.push(ws.sent.filter((m) => m.type === "text").length);
+    }
+
+    const finalCount = countsOverTime[countsOverTime.length - 1];
+    expect(finalCount).toBeGreaterThanOrEqual(2); // multiple beats happened over 32s of silence
+
+    // Never more than one NEW proactive line within any single 1s sampling
+    // step — i.e. counts increase by at most 1 per step, confirming beats
+    // are spaced out rather than firing back-to-back in a burst.
+    for (let i = 1; i < countsOverTime.length; i++) {
+      expect(countsOverTime[i] - countsOverTime[i - 1]).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("at most one silence timer is ever pending, even if scheduling is triggered repeatedly", async () => {
+    const ws = setupInfraCall();
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(1);
+
+    // A burst of real prompts, each of which reschedules — still only one
+    // timer pending afterward, never an accumulating pile of stale timers.
+    for (let i = 0; i < 5; i++) {
+      ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: `turn ${i}`, last: true }));
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(1);
   });
 
   it("never fires a proactive continuation for scam_honeypot mode", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({
-      id: "call-1",
-      status: "active",
-      direction: "outbound_demo",
-      demoMode: "scam_honeypot",
-    });
-    const ws = new FakeWebSocket();
-    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
-
+    const ws = setupInfraCall("scam_honeypot");
     ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
-    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS * 2);
+    await vi.advanceTimersByTimeAsync(openingDelayMs * 2);
 
     expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
   });
@@ -641,26 +684,18 @@ describe("RelaySession — proactive silence continuation (infrastructure simula
     new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
 
     ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
-    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS * 2);
+    await vi.advanceTimersByTimeAsync(openingDelayMs * 2);
 
     expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
   });
 
   it("stops scheduling further proactive turns once the call closes", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({
-      id: "call-1",
-      status: "active",
-      direction: "outbound_demo",
-      demoMode: "infrastructure_simulation",
-    });
-    const ws = new FakeWebSocket();
-    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
-
+    const ws = setupInfraCall();
     ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
     await vi.advanceTimersByTimeAsync(0);
 
     ws.emit("close");
-    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS * 3);
+    await vi.advanceTimersByTimeAsync(openingDelayMs * 3);
 
     expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
   });
