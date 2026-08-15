@@ -2,21 +2,33 @@ import { describe, expect, it } from "vitest";
 import {
   advanceInfraScript,
   INFRA_OPENING_LINE,
-  INFRA_OTHER_FALLBACK_LINE,
   INITIAL_INFRA_SCRIPT_STATE,
+  NARRATIVE_PHASES,
 } from "./infraScript.js";
 
-const HELP_LINE =
+const DELIVERY_OPTIONS_LINE =
   "Great, thank you. One second — I had the delivery information written down somewhere. Could you tell me what delivery options you have while I find it?";
-const TIMING_LINE =
+const URGENCY_LINE =
   "It was definitely urgent. I think this afternoon... actually, hold on, I may be looking at tomorrow's schedule. What's the latest you could deliver today?";
-const INVOICE_LINE =
+const PAPERWORK_LINE =
   "Yes, I think I need an invoice. Although someone here just told me it might need a purchase order first. Could you explain what information you normally need on that?";
-const DETAILS_LINE =
+const ADDRESS_LINE =
+  "Let me just check what address I've got on file... actually, hold on, I think this might be for a different delivery.";
+const WRONG_DOCUMENT_LINE =
   "Of course. Give me one second — I've opened the wrong document. This appears to be my electricity bill.";
 const REPEAT_LINE =
   "Sorry about this. I definitely had the right document open a minute ago. Could you remind me what information you needed from me?";
-const ALL_TOPIC_LINES = [HELP_LINE, TIMING_LINE, INVOICE_LINE, DETAILS_LINE, REPEAT_LINE];
+const NAMED_PHASE_LINES = [
+  DELIVERY_OPTIONS_LINE,
+  URGENCY_LINE,
+  PAPERWORK_LINE,
+  ADDRESS_LINE,
+  WRONG_DOCUMENT_LINE,
+  "Sorry, I think I've mixed up which form was for payment and which was for delivery — hold on, let me sort these out.",
+  "Hold on, I need to check something with a colleague — I'll be right back.",
+  "Sorry, I've confused today's date with tomorrow's again. Let me get that straight.",
+  "Sorry, I think I'm looking at the wrong page now — give me a second to find the right one.",
+];
 
 describe("advanceInfraScript — bot opening line", () => {
   it("INFRA_OPENING_LINE is a fixed, non-empty string never returned by advanceInfraScript itself", () => {
@@ -27,118 +39,124 @@ describe("advanceInfraScript — bot opening line", () => {
 });
 
 describe("advanceInfraScript — regression: exact phrases from the real transcript", () => {
-  it('"Sure. I can help with that." classifies as CAN_HELP and gets the delivery-info line, not a confused fallback', () => {
+  it('"Sure. I can help with that." advances the narrative to its first beat, not a confused fallback', () => {
     const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "Sure. I can help with that.");
     expect(result.transition.intent).toBe("CAN_HELP");
-    expect(result.line).toBe(HELP_LINE);
+    expect(result.transition.mode).toBe("narrative");
+    expect(result.line).toBe(DELIVERY_OPTIONS_LINE);
     expect(result.line).not.toContain("say that again");
   });
 
-  it('"Sure. I can help with that." said AFTER the help topic is already covered gets a delay beat, not the "say that again" fallback', () => {
-    const first = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "Sure, I can help.");
-    const second = advanceInfraScript(first.nextState, "Sure. I can help with that.");
-    expect(second.transition.intent).toBe("CAN_HELP");
-    expect(second.transition.usedBeat).toBe(true);
-    expect(second.line).not.toBe(INFRA_OTHER_FALLBACK_LINE);
-  });
-
-  it('"How urgent?" classifies as DELIVERY_TIMING and gets the timing line, never the invoice/purchase-order beat', () => {
+  it('"How urgent?" gets the urgency beat directly, never the invoice/purchase-order beat', () => {
     const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "How urgent?");
     expect(result.transition.intent).toBe("DELIVERY_TIMING");
-    expect(result.line).toBe(TIMING_LINE);
-    expect(result.line).not.toBe(INVOICE_LINE);
-  });
-
-  it('"How urgent?" gets the timing line regardless of what topics have already been covered (out-of-order)', () => {
-    const afterHelp = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "Sure, I can help.");
-    const afterInvoice = advanceInfraScript(afterHelp.nextState, "Do you need an invoice?");
-    const result = advanceInfraScript(afterInvoice.nextState, "How urgent?");
-    expect(result.transition.intent).toBe("DELIVERY_TIMING");
-    expect(result.line).toBe(TIMING_LINE);
+    expect(result.transition.mode).toBe("direct");
+    expect(result.line).toBe(URGENCY_LINE);
+    expect(result.line).not.toBe(PAPERWORK_LINE);
   });
 });
 
-describe("advanceInfraScript — broad paraphrase coverage per intent", () => {
-  const cases: Array<{ phrase: string; intent: string; line: string }> = [
-    { phrase: "How urgent is it?", intent: "DELIVERY_TIMING", line: TIMING_LINE },
-    { phrase: "When do you need it?", intent: "DELIVERY_TIMING", line: TIMING_LINE },
-    { phrase: "What time?", intent: "DELIVERY_TIMING", line: TIMING_LINE },
-    { phrase: "How soon?", intent: "DELIVERY_TIMING", line: TIMING_LINE },
-    { phrase: "Do you need an invoice?", intent: "INVOICE_OR_PURCHASE_ORDER", line: INVOICE_LINE },
-    { phrase: "How are you paying?", intent: "PAYMENT", line: INVOICE_LINE },
-    { phrase: "Purchase order?", intent: "INVOICE_OR_PURCHASE_ORDER", line: INVOICE_LINE },
-    { phrase: "Do you need paperwork?", intent: "INVOICE_OR_PURCHASE_ORDER", line: INVOICE_LINE },
-    { phrase: "Where do I send it?", intent: "ASK_ADDRESS", line: DETAILS_LINE },
-    { phrase: "What's the delivery address?", intent: "ASK_ADDRESS", line: DETAILS_LINE },
-    { phrase: "Where are you based?", intent: "ASK_ADDRESS", line: DETAILS_LINE },
-    { phrase: "What's your name?", intent: "ASK_NAME", line: DETAILS_LINE },
-    { phrase: "Who am I speaking to?", intent: "ASK_NAME", line: DETAILS_LINE },
-    { phrase: "Sounds good, I can help.", intent: "CAN_HELP", line: HELP_LINE },
-    // Contains both an affirmation and a specific delivery-destination question — the
-    // more specific intent (ASK_ADDRESS) correctly wins, so the reply actually
-    // addresses what was asked instead of just a generic acknowledgement.
-    { phrase: "Sounds good, where should I deliver them?", intent: "ASK_ADDRESS", line: DETAILS_LINE },
-  ];
+describe("advanceInfraScript — intent overrides narrative order, then narrative resumes", () => {
+  it("asking for the address as the very first thing gets the address beat directly", () => {
+    const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "Where should I deliver them?");
+    expect(result.transition.mode).toBe("direct");
+    expect(result.transition.phase).toBe("ADDRESS");
+    expect(result.line).toBe(ADDRESS_LINE);
+  });
 
-  for (const { phrase, intent, line } of cases) {
-    it(`"${phrase}" -> ${intent}`, () => {
+  it("after an out-of-order direct answer, the narrative continues from the beginning of the sequence, skipping what's covered", () => {
+    const afterAddress = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "Where should I deliver them?");
+    const next = advanceInfraScript(afterAddress.nextState, "yeah");
+    // ADDRESS is already covered, so the narrative's next stop is the first
+    // still-uncovered phase in NARRATIVE_PHASES order (DELIVERY_OPTIONS).
+    expect(next.transition.mode).toBe("narrative");
+    expect(next.transition.phase).toBe("DELIVERY_OPTIONS");
+    expect(next.line).toBe(DELIVERY_OPTIONS_LINE);
+  });
+
+  it("asking about payment before anything else still gets the paperwork line", () => {
+    const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "How are you paying for this?");
+    expect(result.line).toBe(PAPERWORK_LINE);
+  });
+
+  it("re-asking a question already answered on demand doesn't repeat verbatim — the narrative continues instead", () => {
+    const first = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "How urgent is it?");
+    const second = advanceInfraScript(first.nextState, "How urgent is it again?");
+    expect(second.line).not.toBe(URGENCY_LINE);
+    expect(second.transition.mode).toBe("narrative");
+  });
+});
+
+describe("advanceInfraScript — vague affirmatives advance the story", () => {
+  for (const phrase of ["yeah", "okay", "sure", "right", "yep", "ok"]) {
+    it(`"${phrase}" is treated as permission to continue, not a topic answer`, () => {
       const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, phrase);
-      expect(result.transition.intent).toBe(intent);
-      expect(result.line).toBe(line);
+      expect(result.transition.intent).toBe("CAN_HELP");
+      expect(result.transition.mode).toBe("narrative");
+      expect(result.line).toBe(DELIVERY_OPTIONS_LINE);
     });
   }
 
-  it('a bare "What?" classifies as CONFUSED, not DELIVERY_TIMING', () => {
+  it("a vague affirmative later in the call advances to the next uncovered beat, not back to the start", () => {
+    const first = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "sure");
+    const second = advanceInfraScript(first.nextState, "okay");
+    expect(second.line).toBe(URGENCY_LINE);
+  });
+});
+
+describe("advanceInfraScript — unintelligible/unrelated input still leads to useful progression", () => {
+  it("unintelligible garbage still advances the narrative instead of asking to repeat", () => {
+    const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "asdkj qwoe mglbh");
+    expect(result.transition.intent).toBe("OTHER");
+    expect(result.transition.mode).toBe("narrative");
+    expect(result.line).toBe(DELIVERY_OPTIONS_LINE);
+  });
+
+  it("empty input (used for silence continuations) also advances the narrative", () => {
+    const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "");
+    expect(result.transition.intent).toBe("OTHER");
+    expect(result.line).toBe(DELIVERY_OPTIONS_LINE);
+  });
+
+  it("something entirely unrelated still moves the story forward rather than getting stuck", () => {
+    const first = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "so how's the weather where you are?");
+    const second = advanceInfraScript(first.nextState, "nice, anyway, go on");
+    expect(second.transition.mode).toBe("narrative");
+    expect(second.line).not.toBe(first.line);
+  });
+
+  it("unrelated input never gets permanently stuck: many consecutive off-topic turns still keep producing new beats", () => {
+    let state = INITIAL_INFRA_SCRIPT_STATE;
+    const seenLines = new Set<string>();
+    for (let i = 0; i < 12; i++) {
+      const result = advanceInfraScript(state, `totally unrelated remark number ${i}`);
+      seenLines.add(result.line);
+      state = result.nextState;
+    }
+    expect(seenLines.size).toBeGreaterThan(1);
+  });
+});
+
+describe("advanceInfraScript — CONFUSED/REPEAT_REQUEST", () => {
+  it('a bare "What?" restates without advancing the narrative', () => {
     const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "What?");
     expect(result.transition.intent).toBe("CONFUSED");
+    expect(result.transition.mode).toBe("clarify");
     expect(result.line).toBe(REPEAT_LINE);
+    expect(result.nextState.coveredPhases.size).toBe(0);
   });
 
-  it('"Sorry, come again?" classifies as a repeat-request and gets the repeat line', () => {
-    const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "Sorry, come again?");
-    expect(["CONFUSED", "REPEAT_REQUEST"]).toContain(result.transition.intent);
-    expect(result.line).toBe(REPEAT_LINE);
-  });
-});
-
-describe("advanceInfraScript — out-of-order questions answered sensibly", () => {
-  it("asking for the address as the very first thing gets the address/details joke, not a generic fallback", () => {
-    const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "Where should I deliver them?");
-    expect(result.transition.intent).toBe("ASK_ADDRESS");
-    expect(result.line).toBe(DETAILS_LINE);
-  });
-
-  it("asking about payment before anything else still gets the invoice/payment line", () => {
-    const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "How are you paying for this?");
-    expect(result.line).toBe(INVOICE_LINE);
-  });
-});
-
-describe("advanceInfraScript — unrecognized utterance never auto-advances the story", () => {
-  it("replies with the neutral fallback and does not mark any topic covered on the first mismatch", () => {
-    const result = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "What's the weather like today?");
-    expect(result.transition.intent).toBe("OTHER");
-    expect(result.line).toBe(INFRA_OTHER_FALLBACK_LINE);
-    expect(result.nextState.coveredGroups.size).toBe(0);
-    expect(result.nextState.fallbackStreak).toBe(1);
-  });
-
-  it("force-progresses via a delay beat on a second consecutive mismatch, still without marking any topic covered", () => {
-    const first = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "unrelated nonsense");
-    const second = advanceInfraScript(first.nextState, "still unrelated nonsense");
-
-    expect(second.transition.intent).toBe("OTHER");
-    expect(second.transition.usedBeat).toBe(true);
-    expect(second.nextState.coveredGroups.size).toBe(0);
-    expect(second.nextState.fallbackStreak).toBe(0);
-    expect(ALL_TOPIC_LINES).not.toContain(second.line);
-  });
-
-  it("a later recognized intent still gets its topic line even after earlier unrecognized turns", () => {
-    const afterFallback = advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "random chit chat");
-    const result = advanceInfraScript(afterFallback.nextState, "How urgent is it?");
-    expect(result.transition.intent).toBe("DELIVERY_TIMING");
-    expect(result.line).toBe(TIMING_LINE);
+  it("persistent confusion eventually continues the story instead of restating forever", () => {
+    let state = INITIAL_INFRA_SCRIPT_STATE;
+    const modes: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const result = advanceInfraScript(state, "sorry, what?");
+      modes.push(result.transition.mode);
+      state = result.nextState;
+    }
+    // Never gets stuck saying "sorry, what?" indefinitely — narrative
+    // progress happens at least once within a handful of repeated turns.
+    expect(modes).toContain("narrative");
   });
 });
 
@@ -152,44 +170,47 @@ describe("advanceInfraScript — indefinite continuation / no-response preventio
     expect(() => advanceInfraScript(INITIAL_INFRA_SCRIPT_STATE, "🚁🚁")).not.toThrow();
   });
 
-  it("always returns a non-empty line across a long simulated conversation, mixing recognized and unrecognized turns", () => {
+  it("conversation can continue for many turns (30+) without exhausting scripted material", () => {
     let state = INITIAL_INFRA_SCRIPT_STATE;
     const turns = [
-      "Sure, I can help.",
-      "How urgent is it?",
+      "sure",
+      "how urgent is it?",
       "random babble",
-      "more random babble",
-      "Do you need an invoice?",
-      "What's your address?",
-      "Sorry, what?",
-      "still going on and on",
-      "another random thing",
-      "How urgent is it again?",
+      "",
+      "do you need an invoice?",
+      "what's your address?",
+      "sorry, what?",
+      "yeah",
+      "another unrelated thing",
+      "okay go on",
     ];
-    for (let i = 0; i < 60; i++) {
-      const phrase = turns[i % turns.length];
-      const result = advanceInfraScript(state, phrase);
+    for (let i = 0; i < 40; i++) {
+      const result = advanceInfraScript(state, turns[i % turns.length]);
       expect(result.line.length).toBeGreaterThan(0);
       state = result.nextState;
     }
   });
 
-  it("repeating the same recognized intent after it's covered cycles through delay beats rather than repeating the line", () => {
+  it("once every named phase is covered, EXTENDED_DELAY cycles through varied lines forever", () => {
     let state = INITIAL_INFRA_SCRIPT_STATE;
+    // Cover every named phase via generic "continue" turns.
+    for (let i = 0; i < NARRATIVE_PHASES.length - 1; i++) {
+      const result = advanceInfraScript(state, "yeah");
+      state = result.nextState;
+    }
     const seen = new Set<string>();
-    for (let i = 0; i < 8; i++) {
-      const result = advanceInfraScript(state, "How urgent is it?");
+    for (let i = 0; i < 12; i++) {
+      const result = advanceInfraScript(state, "yeah");
+      expect(result.transition.phase).toBe("EXTENDED_DELAY");
       seen.add(result.line);
       state = result.nextState;
     }
-    // First response is the timing line; every repeat after that is a beat, never the timing line again.
-    expect(seen.has(TIMING_LINE)).toBe(true);
     expect(seen.size).toBeGreaterThan(1);
+    for (const line of seen) expect(NAMED_PHASE_LINES).not.toContain(line);
   });
 });
 
 describe("safety: no plausible sensitive content in any scripted line", () => {
-  const allLines = [INFRA_OPENING_LINE, ...ALL_TOPIC_LINES, INFRA_OTHER_FALLBACK_LINE];
   const bannedTerms = [
     "military",
     "army",
@@ -204,6 +225,7 @@ describe("safety: no plausible sensitive content in any scripted line", () => {
   ];
 
   it("contains none of the disallowed sensitive-content terms", () => {
+    const allLines = [INFRA_OPENING_LINE, ...NAMED_PHASE_LINES, REPEAT_LINE];
     for (const line of allLines) {
       const lower = line.toLowerCase();
       for (const term of bannedTerms) {
@@ -213,6 +235,7 @@ describe("safety: no plausible sensitive content in any scripted line", () => {
   });
 
   it("no scripted line contains a long digit run resembling an ID/credential", () => {
+    const allLines = [INFRA_OPENING_LINE, ...NAMED_PHASE_LINES, REPEAT_LINE];
     for (const line of allLines) {
       expect(line).not.toMatch(/\d{6,}/);
     }

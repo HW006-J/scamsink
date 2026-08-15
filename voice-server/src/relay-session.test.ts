@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 
 const {
   getCallByTwilioSidMock,
@@ -406,7 +406,7 @@ describe("RelaySession — infrastructure simulation mode", () => {
     expect(recordCallEventMock).toHaveBeenCalledWith(
       "call-1",
       "infra_script_turn",
-      expect.objectContaining({ intent: "CAN_HELP", group: "help", usedBeat: false }),
+      expect.objectContaining({ intent: "CAN_HELP", phase: "DELIVERY_OPTIONS", mode: "narrative" }),
     );
   });
 
@@ -522,5 +522,146 @@ describe("RelaySession — rapid speech cannot wedge the state", () => {
     for (const msg of textMessages) {
       expect((msg.token as string).length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("RelaySession — proactive silence continuation (infrastructure simulation only)", () => {
+  const SILENCE_TIMEOUT_MS = 7_000;
+
+  beforeEach(() => {
+    getCallByTwilioSidMock.mockReset();
+    markCallActiveMock.mockReset().mockResolvedValue(undefined);
+    markCallEndedMock.mockReset().mockResolvedValue(undefined);
+    appendTranscriptMessageMock.mockReset().mockResolvedValue(undefined);
+    recordCallEventMock.mockReset().mockResolvedValue(undefined);
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("silence causes a proactive scripted continuation after the timeout", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "infrastructure_simulation",
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS);
+
+    const textMessages = ws.sent.filter((m) => m.type === "text");
+    expect(textMessages).toHaveLength(1);
+    expect((textMessages[0].token as string).length).toBeGreaterThan(0);
+    expect(recordCallEventMock).toHaveBeenCalledWith(
+      "call-1",
+      "infra_script_turn",
+      expect.objectContaining({ intent: "OTHER", mode: "narrative" }),
+    );
+  });
+
+  it("a real prompt before the timeout cancels the pending proactive continuation — no overlapping speech", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "infrastructure_simulation",
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Real caller speech arrives well before the silence timeout would fire.
+    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS - 3_000);
+    ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Sure, I can help.", last: true }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1);
+
+    // Advance past when the ORIGINAL (now-cancelled) timer would have fired.
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1); // still just the one real reply — no overlap
+  });
+
+  it("repeated silence produces sequential, non-overlapping proactive turns, never more than one per interval", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "infrastructure_simulation",
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(2);
+
+    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS);
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(3);
+
+    const lines = ws.sent.filter((m) => m.type === "text").map((m) => m.token);
+    expect(new Set(lines).size).toBe(lines.length); // each proactive turn said something different
+  });
+
+  it("never fires a proactive continuation for scam_honeypot mode", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "scam_honeypot",
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS * 2);
+
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
+  });
+
+  it("never fires a proactive continuation for real inbound (dynamic Groq) calls", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({ id: "call-1", status: "active", direction: "inbound", demoMode: null });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS * 2);
+
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
+  });
+
+  it("stops scheduling further proactive turns once the call closes", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "infrastructure_simulation",
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    ws.emit("close");
+    await vi.advanceTimersByTimeAsync(SILENCE_TIMEOUT_MS * 3);
+
+    expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
   });
 });

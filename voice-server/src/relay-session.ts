@@ -16,7 +16,7 @@ import {
 } from "./demoScript.js";
 import {
   advanceInfraScript,
-  INFRA_OTHER_FALLBACK_LINE,
+  INFRA_SAFE_FALLBACK_LINE,
   INITIAL_INFRA_SCRIPT_STATE,
   type InfraScriptState,
 } from "./infraScript.js";
@@ -25,6 +25,13 @@ type ScriptMode = "none" | "scam_honeypot" | "infrastructure_simulation";
 
 const FALLBACK_LINE =
   "Sorry, I'm having a bit of trouble hearing you right now. I'll have to call you back.";
+
+// ConversationRelay doesn't expose a documented silence/no-input timeout
+// event (checked against Twilio's own reference: the only turn-boundary
+// controls are speechTimeout/eotThreshold, which govern when an in-progress
+// utterance is finalized, not "the human hasn't said anything at all"), so
+// infrastructure-simulation calls track this themselves with a plain timer.
+const SILENCE_TIMEOUT_MS = 7_000;
 
 interface TwilioInboundMessage {
   type: string;
@@ -55,6 +62,13 @@ export class RelaySession {
   private scriptMode: ScriptMode = "none";
   private scriptState: DemoScriptState = INITIAL_DEMO_SCRIPT_STATE;
   private infraScriptState: InfraScriptState = INITIAL_INFRA_SCRIPT_STATE;
+  // Proactive-continuation timer for infrastructure-simulation calls only.
+  // silenceToken invalidates a scheduled timer the instant any real
+  // prompt/interrupt arrives, so a proactive line can't fire on top of one
+  // already produced by real caller input; the timer is always cleared
+  // before a new one is scheduled, so at most one is ever pending.
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private silenceToken = 0;
 
   constructor(
     private readonly ws: WebSocket,
@@ -89,10 +103,17 @@ export class RelaySession {
         await this.handleSetup(message);
         return;
       case "prompt":
+        // Any real prompt means the human isn't silent — invalidate
+        // whatever proactive-continuation timer might be pending before
+        // it's rescheduled again once this turn's reply is sent.
+        this.silenceToken += 1;
+        this.clearSilenceTimer();
         await this.handlePrompt(message);
         return;
       case "interrupt":
         // Caller started talking over ScamSink — abandon the in-flight reply.
+        this.silenceToken += 1;
+        this.clearSilenceTimer();
         this.generation += 1;
         return;
       case "dtmf":
@@ -100,6 +121,38 @@ export class RelaySession {
       default:
         return;
     }
+  }
+
+  private clearSilenceTimer(): void {
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
+  }
+
+  /** Infrastructure-simulation only. Always cancels any existing timer first, so at most one is ever pending. */
+  private scheduleSilenceTimer(): void {
+    if (this.closed || this.scriptMode !== "infrastructure_simulation") return;
+    this.clearSilenceTimer();
+    const token = this.silenceToken;
+    this.silenceTimer = setTimeout(() => {
+      this.handleSilenceTimeout(token).catch((err) => console.error("[relay] silence timeout handling error", err));
+    }, SILENCE_TIMEOUT_MS);
+  }
+
+  /**
+   * Fires after SILENCE_TIMEOUT_MS with no real caller activity. Treated as
+   * an empty utterance through the exact same infra-script path a real
+   * "vague/unintelligible" turn would take — advanceInfraScript already
+   * classifies empty text as OTHER and continues the narrative, so this
+   * reuses fully-tested logic rather than inventing a separate mechanism.
+   */
+  private async handleSilenceTimeout(token: number): Promise<void> {
+    this.silenceTimer = null;
+    if (this.closed || token !== this.silenceToken) return; // real activity happened since this was scheduled
+    const generation = this.generation;
+    await this.handleInfraScriptedPrompt("", generation);
+    this.scheduleSilenceTimer();
   }
 
   private async handleSetup(message: TwilioInboundMessage): Promise<void> {
@@ -128,6 +181,9 @@ export class RelaySession {
           ? "infrastructure_simulation"
           : "scam_honeypot"
         : "none";
+    // Start waiting for either a reply or silence — ScamSink carries the
+    // conversation forward on its own if the human doesn't respond.
+    this.scheduleSilenceTimer();
     await Promise.all([
       markCallActive(message.callSid),
       recordCallEvent(call.id, "voice_server_connected"),
@@ -152,6 +208,7 @@ export class RelaySession {
     }
     if (this.scriptMode === "infrastructure_simulation") {
       await this.handleInfraScriptedPrompt(redacted, generation);
+      this.scheduleSilenceTimer();
       return;
     }
 
@@ -234,10 +291,11 @@ export class RelaySession {
 
   /**
    * Deterministic reply path for "CRITICAL INFRASTRUCTURE SIMULATION" demo
-   * calls. Same shape and same guarantees as handleScriptedPrompt: pure,
-   * synchronous state machine, no network call that can hang, and a reply
-   * is always sent unless the caller has already interrupted or the
-   * connection is closed.
+   * calls — called both reactively (a real caller prompt) and proactively
+   * (handleSilenceTimeout, with an empty humanText). Same shape and same
+   * guarantees as handleScriptedPrompt: pure, synchronous state machine, no
+   * network call that can hang, and a reply is always sent unless the
+   * caller has already interrupted or the connection is closed.
    */
   private async handleInfraScriptedPrompt(humanText: string, generation: number): Promise<void> {
     let line: string;
@@ -248,13 +306,13 @@ export class RelaySession {
       if (this.callId) {
         await recordCallEvent(this.callId, "infra_script_turn", {
           intent: result.transition.intent,
-          group: result.transition.group,
-          usedBeat: result.transition.usedBeat,
+          phase: result.transition.phase,
+          mode: result.transition.mode,
         }).catch(() => {});
       }
     } catch (err) {
       console.error("[relay] infra script state machine failed, using safe fallback:", err);
-      line = INFRA_OTHER_FALLBACK_LINE;
+      line = INFRA_SAFE_FALLBACK_LINE;
     }
 
     if (this.closed || generation !== this.generation) return;
@@ -270,6 +328,7 @@ export class RelaySession {
 
   private async handleClose(): Promise<void> {
     this.closed = true;
+    this.clearSilenceTimer();
     if (!this.callSid) return;
     await markCallEnded(this.callSid, "completed").catch((err) =>
       console.error("[relay] failed to mark call completed on disconnect", err),
