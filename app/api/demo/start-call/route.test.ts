@@ -168,26 +168,23 @@ describe("POST /api/demo/start-call", () => {
     expect(createCallMock).not.toHaveBeenCalled();
   });
 
-  it("defaults to scam_honeypot mode when no mode is specified", async () => {
+  // The scam-honeypot mode has been removed entirely: mode is no longer
+  // client-selectable at all — every call this route creates is explicitly
+  // infrastructure_simulation, regardless of what (if anything) the
+  // request body contains.
+  it("always creates calls as infrastructure_simulation when no body is sent", async () => {
     await POST(makeRequest("correct-horse-battery-staple"));
-    expect(createCallMock).toHaveBeenCalledWith(expect.objectContaining({ demoMode: "scam_honeypot" }));
-  });
-
-  it("accepts infrastructure_simulation mode explicitly", async () => {
-    const res = await POST(
-      makeRequest("correct-horse-battery-staple", { to: "+447940757160", mode: "infrastructure_simulation" }),
-    );
-
-    expect(res.status).toBe(200);
     expect(createCallMock).toHaveBeenCalledWith(expect.objectContaining({ demoMode: "infrastructure_simulation" }));
   });
 
-  it("falls back to scam_honeypot for an unrecognized mode value, never trusting client input directly", async () => {
-    await POST(makeRequest("correct-horse-battery-staple", { to: "+447940757160", mode: "definitely-not-a-real-mode" }));
-    expect(createCallMock).toHaveBeenCalledWith(expect.objectContaining({ demoMode: "scam_honeypot" }));
+  it("always creates calls as infrastructure_simulation even if the client sends a different mode field, never trusting client input", async () => {
+    await POST(
+      makeRequest("correct-horse-battery-staple", { to: "+447940757160", mode: "scam_honeypot" }),
+    );
+    expect(createCallMock).toHaveBeenCalledWith(expect.objectContaining({ demoMode: "infrastructure_simulation" }));
   });
 
-  it("still enforces the allowlist when mode is infrastructure_simulation — mode never bypasses destination checks", async () => {
+  it("still enforces the allowlist regardless of any mode field in the body", async () => {
     const res = await POST(
       makeRequest("correct-horse-battery-staple", { to: "+447700900999", mode: "infrastructure_simulation" }),
     );
@@ -198,7 +195,7 @@ describe("POST /api/demo/start-call", () => {
     expect(twilioCallsCreateMock).not.toHaveBeenCalled();
   });
 
-  it("still enforces operator auth when mode is infrastructure_simulation", async () => {
+  it("still enforces operator auth regardless of any mode field in the body", async () => {
     const res = await POST(makeRequest("wrong", { to: "+447940757160", mode: "infrastructure_simulation" }));
     expect(res.status).toBe(401);
     expect(twilioCallsCreateMock).not.toHaveBeenCalled();

@@ -7,13 +7,6 @@ import {
   recordCallEvent,
 } from "./db.js";
 import { redactSensitiveNumbers } from "./redact.js";
-import { AIProviderError, boundHistory, type AIProvider, type ConversationTurn } from "./ai/index.js";
-import {
-  advanceDemoScript,
-  DEMO_SCRIPT_FALLBACK_LINE,
-  INITIAL_DEMO_SCRIPT_STATE,
-  type DemoScriptState,
-} from "./demoScript.js";
 import {
   advanceInfraScript,
   INFRA_OPENING_LINE,
@@ -22,11 +15,6 @@ import {
   type InfraScriptState,
 } from "./infraScript.js";
 import { estimateProactiveDelayMs } from "./ttsTiming.js";
-
-type ScriptMode = "none" | "scam_honeypot" | "infrastructure_simulation";
-
-const FALLBACK_LINE =
-  "Sorry, I'm having a bit of trouble hearing you right now. I'll have to call you back.";
 
 interface TwilioInboundMessage {
   type: string;
@@ -39,36 +27,35 @@ interface TwilioInboundMessage {
 }
 
 /**
- * One ConversationRelay WebSocket connection == one phone call. Owns the
- * conversation history, talks to the AI provider, and persists the
- * transcript as it goes so the dashboard sees it live.
+ * One ConversationRelay WebSocket connection == one phone call. The product
+ * is outbound-only now (infrastructure simulation): the Next.js app never
+ * routes a genuinely new inbound call here at all — see
+ * app/api/twilio/voice/route.ts, which answers unexpected inbound calls
+ * with a safe, non-interactive hangup instead of connecting to this relay.
+ * So every call this class ever sees is an outbound_demo call, and its
+ * reply is always the deterministic infra-simulation script — no LLM/Groq
+ * involvement anywhere in this path.
  */
 export class RelaySession {
   private callSid: string | null = null;
   private callId: string | null = null;
-  private history: ConversationTurn[] = [];
   private closed = false;
   private generation = 0;
-  // Outbound demo calls follow one of two deterministic comedy scripts
-  // instead of free-form Groq replies, decided once at setup from the
-  // call's direction + demo_mode and never changed mid-call. Each
-  // RelaySession is one WS connection per call, so this state is
-  // inherently isolated per call — no cross-call sharing is possible.
-  private scriptMode: ScriptMode = "none";
-  private scriptState: DemoScriptState = INITIAL_DEMO_SCRIPT_STATE;
+  // Defensive: even though the Next.js app never routes a genuine inbound
+  // call to this relay (see the class doc above), this guard means that if
+  // a non-outbound_demo row ever did reach here, RelaySession would simply
+  // stay silent rather than engaging with any script.
+  private isOutboundDemo = false;
   private infraScriptState: InfraScriptState = INITIAL_INFRA_SCRIPT_STATE;
-  // Proactive-continuation timer for infrastructure-simulation calls only.
-  // silenceToken invalidates a scheduled timer the instant any real
-  // prompt/interrupt arrives, so a proactive line can't fire on top of one
-  // already produced by real caller input; the timer is always cleared
-  // before a new one is scheduled, so at most one is ever pending.
+  // Proactive-continuation timer. silenceToken invalidates a scheduled
+  // timer the instant any real prompt/interrupt arrives, so a proactive
+  // line can't fire on top of one already produced by real caller input;
+  // the timer is always cleared before a new one is scheduled, so at most
+  // one is ever pending.
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private silenceToken = 0;
 
-  constructor(
-    private readonly ws: WebSocket,
-    private readonly aiProvider: AIProvider,
-  ) {
+  constructor(private readonly ws: WebSocket) {
     ws.on("message", (raw) => {
       this.handleMessage(raw).catch((err) => console.error("[relay] message handling error", err));
     });
@@ -126,15 +113,15 @@ export class RelaySession {
   }
 
   /**
-   * Infrastructure-simulation only. Delay is estimated from `justSpokenLine`
-   * — not a flat constant — so the window scales with how long that
-   * specific line actually takes to speak (see ttsTiming.ts): estimated
-   * playback time, THEN a genuine human-response grace period, only after
-   * which a proactive continuation may fire. Always cancels any existing
-   * timer first, so at most one is ever pending.
+   * Delay is estimated from `justSpokenLine` — not a flat constant — so the
+   * window scales with how long that specific line actually takes to speak
+   * (see ttsTiming.ts): estimated playback time, THEN a genuine
+   * human-response grace period, only after which a proactive continuation
+   * may fire. Always cancels any existing timer first, so at most one is
+   * ever pending.
    */
   private scheduleSilenceTimer(justSpokenLine: string): void {
-    if (this.closed || this.scriptMode !== "infrastructure_simulation") return;
+    if (this.closed) return;
     this.clearSilenceTimer();
     const token = this.silenceToken;
     const delayMs = estimateProactiveDelayMs(justSpokenLine);
@@ -149,8 +136,8 @@ export class RelaySession {
    * through the exact same infra-script path a real "vague/unintelligible"
    * turn would take — advanceInfraScript already classifies empty text as
    * OTHER and continues the narrative, so this reuses fully-tested logic
-   * rather than inventing a separate mechanism. Rescheduling the NEXT
-   * timer happens inside handleInfraScriptedPrompt itself, estimated from
+   * rather than inventing a separate mechanism. Rescheduling the NEXT timer
+   * happens inside handleInfraScriptedPrompt itself, estimated from
    * whatever line this proactive turn just spoke — so a silent call gets
    * naturally spaced beats, never back-to-back TTS.
    */
@@ -181,17 +168,12 @@ export class RelaySession {
     }
 
     this.callId = call.id;
-    this.scriptMode =
-      call.direction === "outbound_demo"
-        ? call.demoMode === "infrastructure_simulation"
-          ? "infrastructure_simulation"
-          : "scam_honeypot"
-        : "none";
+    this.isOutboundDemo = call.direction === "outbound_demo";
     // Start waiting for either a reply or silence — ScamSink carries the
     // conversation forward on its own if the human doesn't respond. The
     // opening line itself was just spoken via TwiML welcomeGreeting (see
     // app/api/twilio/voice/route.ts), so estimate ITS playback time too.
-    if (this.scriptMode === "infrastructure_simulation") {
+    if (this.isOutboundDemo) {
       this.scheduleSilenceTimer(INFRA_OPENING_LINE);
     }
     await Promise.all([
@@ -202,109 +184,26 @@ export class RelaySession {
 
   private async handlePrompt(message: TwilioInboundMessage): Promise<void> {
     const text = message.voicePrompt?.trim();
-    if (!text || !this.callId || !this.callSid) return;
+    if (!text || !this.callId || !this.callSid || !this.isOutboundDemo) return;
 
     const redacted = redactSensitiveNumbers(text);
-    this.history.push({ role: "user", content: redacted });
     await appendTranscriptMessage(this.callId, "caller", redacted).catch((err) =>
       console.error("[relay] failed to persist caller transcript", err),
     );
 
     const generation = this.generation;
-
-    if (this.scriptMode === "scam_honeypot") {
-      await this.handleScriptedPrompt(redacted, generation);
-      return;
-    }
-    if (this.scriptMode === "infrastructure_simulation") {
-      await this.handleInfraScriptedPrompt(redacted, generation);
-      return;
-    }
-
-    let fullReply = "";
-
-    try {
-      fullReply = await this.aiProvider.streamReply(boundHistory(this.history), (token) => {
-        if (this.closed || generation !== this.generation) return;
-        this.send({ type: "text", token, last: false });
-      });
-    } catch (err) {
-      const detail = err instanceof AIProviderError ? err.message : String(err);
-      // The cause is the underlying SDK error (e.g. "401 Invalid API Key",
-      // "model_not_found") — safe to log: provider SDKs don't echo the API
-      // key back in error messages, and this is what actually explains a
-      // failure beyond the generic wrapper message.
-      const cause =
-        err instanceof AIProviderError && err.cause instanceof Error ? err.cause.message : undefined;
-      console.error("[relay] AI provider failed:", detail, cause ? `(cause: ${cause})` : "");
-      if (this.callId) {
-        await recordCallEvent(this.callId, "ai_provider_error", { message: detail, cause }).catch(() => {});
-      }
-      if (!this.closed && generation === this.generation) {
-        this.send({ type: "text", token: FALLBACK_LINE, last: true });
-        this.send({ type: "end" });
-      }
-      return;
-    }
-
-    if (this.closed || generation !== this.generation) return;
-
-    this.send({ type: "text", token: "", last: true });
-
-    if (fullReply.trim()) {
-      this.history.push({ role: "assistant", content: fullReply });
-      if (this.callId) {
-        await appendTranscriptMessage(this.callId, "scamsink", fullReply).catch((err) =>
-          console.error("[relay] failed to persist scamsink transcript", err),
-        );
-      }
-    }
+    await this.handleInfraScriptedPrompt(redacted, generation);
   }
 
   /**
-   * Deterministic reply path for outbound demo calls. advanceDemoScript is
+   * Deterministic reply path for "CRITICAL INFRASTRUCTURE SIMULATION"
+   * calls — called both reactively (a real caller prompt) and proactively
+   * (handleSilenceTimeout, with an empty humanText). advanceInfraScript is
    * synchronous and pure — there is no network call here that can hang or
    * fail — but this is still wrapped defensively so that even a bug in the
    * state machine can never result in silence: `line` is always set to
    * either a scripted line or the fixed fallback, and a reply is always
-   * sent (respecting the same interrupt/close checks as the dynamic path).
-   */
-  private async handleScriptedPrompt(callerText: string, generation: number): Promise<void> {
-    let line: string;
-    try {
-      const result = advanceDemoScript(this.scriptState, callerText);
-      this.scriptState = result.nextState;
-      line = result.line;
-      if (this.callId) {
-        await recordCallEvent(this.callId, "demo_script_turn", {
-          fromIndex: result.transition.fromIndex,
-          toIndex: result.transition.toIndex,
-          matched: result.transition.matched,
-        }).catch(() => {});
-      }
-    } catch (err) {
-      console.error("[relay] demo script state machine failed, using safe fallback:", err);
-      line = DEMO_SCRIPT_FALLBACK_LINE;
-    }
-
-    if (this.closed || generation !== this.generation) return;
-
-    this.send({ type: "text", token: line, last: true });
-
-    if (this.callId) {
-      await appendTranscriptMessage(this.callId, "scamsink", line).catch((err) =>
-        console.error("[relay] failed to persist scamsink transcript", err),
-      );
-    }
-  }
-
-  /**
-   * Deterministic reply path for "CRITICAL INFRASTRUCTURE SIMULATION" demo
-   * calls — called both reactively (a real caller prompt) and proactively
-   * (handleSilenceTimeout, with an empty humanText). Same shape and same
-   * guarantees as handleScriptedPrompt: pure, synchronous state machine, no
-   * network call that can hang, and a reply is always sent unless the
-   * caller has already interrupted or the connection is closed.
+   * sent (respecting the same interrupt/close checks throughout).
    */
   private async handleInfraScriptedPrompt(humanText: string, generation: number): Promise<void> {
     let line: string;

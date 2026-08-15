@@ -6,7 +6,13 @@ export type CallStatus = (typeof CALL_STATUSES)[number];
 export const CALL_DIRECTIONS = ["inbound", "outbound_demo"] as const;
 export type CallDirection = (typeof CALL_DIRECTIONS)[number];
 
-export const DEMO_MODES = ["scam_honeypot", "infrastructure_simulation"] as const;
+// The scam-honeypot mode has been removed from the product; this remains a
+// (currently single-value) union rather than a bare string literal so
+// createCall()'s demoMode param and the schema below stay type-checked.
+// Historical rows may still contain 'scam_honeypot' in the database — that's
+// fine, this type only constrains what the app can WRITE going forward, and
+// the schema below is never runtime-validated against DB data (see callers).
+export const DEMO_MODES = ["infrastructure_simulation"] as const;
 export type DemoMode = (typeof DEMO_MODES)[number];
 
 export const SPEAKERS = ["caller", "scamsink", "system"] as const;
@@ -88,14 +94,10 @@ export type CallHistoryItem = z.infer<typeof callHistoryItemSchema>;
 export const dashboardStateSchema = z.object({
   call: callSnapshotSchema.nullable(),
   transcript: z.array(transcriptMessageSchema),
+  // Scoped to demo_mode='infrastructure_simulation' completed calls only,
+  // so a legacy scam-demo call sitting in the database is never
+  // misrepresented as infrastructure-simulation activity.
   metrics: callMetricsSchema,
-  // Same shape as `metrics`, scoped to demo_mode='infrastructure_simulation'
-  // completed calls only — the "SIMULATED ADVERSARY TIME DIVERTED" panel.
-  simulationMetrics: callMetricsSchema,
-  // Same shape, scoped to demo_mode='scam_honeypot' completed calls only —
-  // the compact breakdown card paired with simulationMetrics. `metrics`
-  // above remains the true grand total (including any real inbound calls).
-  scamHoneypotMetrics: callMetricsSchema,
   recentCalls: z.array(callHistoryItemSchema),
   serverTimeMs: z.number(),
 });

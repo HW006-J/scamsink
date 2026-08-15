@@ -1,11 +1,10 @@
 /**
  * Deterministic comedy script for "CRITICAL INFRASTRUCTURE SIMULATION" demo
- * calls — a second scripted outbound demo mode, structurally similar to
- * demoScript.ts (a small, pure, synchronous state machine; no LLM
- * involved), themed as a vendor/procurement pretexting simulation instead
- * of a financial scam. This is a SIMULATION: it only ever runs on calls to
- * the same operator-authenticated, server-side allowlisted numbers used by
- * the existing demo — never a real technician, supplier, or third party.
+ * calls — the product's only outbound demo mode: a small, pure, synchronous
+ * state machine, no LLM involved, themed as a vendor/procurement
+ * pretexting simulation. This is a SIMULATION: it only ever runs on calls
+ * to the same operator-authenticated, server-side allowlisted numbers used
+ * by the demo — never a real technician, supplier, or third party.
  *
  * All content here is deliberately generic and fictional (unspecified
  * "parts", a round number of drones, a generic "delivery"/"invoice"/

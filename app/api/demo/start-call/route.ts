@@ -5,7 +5,7 @@ import { isAuthorizedDemoOperator } from "@/lib/demoAuth";
 import { getServerEnv } from "@/lib/env";
 import { maskPhoneNumber } from "@/lib/mask";
 import { isAllowedDemoDestination, normalizePhoneNumberToE164, parseAllowedPhoneNumbers } from "@/lib/phone";
-import { DEMO_MODES, PERSONA_DEFAULT, type DemoMode } from "@/lib/types";
+import { PERSONA_DEFAULT } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -47,8 +47,10 @@ export async function POST(request: Request) {
     );
   }
 
-  const requestedMode = (body as { mode?: unknown } | null)?.mode;
-  const demoMode: DemoMode = DEMO_MODES.includes(requestedMode as DemoMode) ? (requestedMode as DemoMode) : "scam_honeypot";
+  // The scam-honeypot mode has been removed — every call this route creates
+  // is explicitly infrastructure_simulation. Never inferred from the
+  // request body or anything else; the client has no say in this.
+  const demoMode = "infrastructure_simulation" as const;
 
   // The operator's own configured demo number is always allowed, on top of
   // whatever else is explicitly allowlisted. Client input never determines
