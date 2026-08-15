@@ -1,5 +1,5 @@
 import { query, queryOne } from "./db";
-import type { CallDirection, CallStatus, DashboardState, Speaker } from "./types";
+import type { CallDetail, CallDirection, CallHistoryItem, CallMetrics, CallStatus, DashboardState, Speaker } from "./types";
 
 export interface CallLookup {
   id: string;
@@ -18,6 +18,14 @@ export async function getActiveCall(): Promise<CallLookup | null> {
   return queryOne<CallLookup>(
     `select id, status from calls where status in ('ringing', 'active') order by created_at desc limit 1`,
   );
+}
+
+/** Used to enforce a cooldown between demo call creations, regardless of outcome. */
+export async function getMostRecentDemoCallCreatedAt(): Promise<Date | null> {
+  const row = await queryOne<{ created_at: Date }>(
+    `select created_at from calls where direction = 'outbound_demo' order by created_at desc limit 1`,
+  );
+  return row?.created_at ?? null;
 }
 
 interface CreateCallInput {
@@ -122,10 +130,114 @@ function toIso(value: Date | null): string | null {
   return value ? value.toISOString() : null;
 }
 
+function toCallSnapshot(call: CallRow) {
+  return {
+    id: call.id,
+    status: call.status,
+    direction: call.direction,
+    callerNumberMasked: call.caller_number_masked,
+    startedAt: toIso(call.started_at),
+    endedAt: toIso(call.ended_at),
+    durationSeconds: call.duration_seconds,
+    persona: call.persona,
+  };
+}
+
+function toTranscript(rows: TranscriptRow[]) {
+  return rows.map((row) => ({
+    id: row.id,
+    speaker: row.speaker,
+    content: row.content,
+    createdAt: row.created_at.toISOString(),
+  }));
+}
+
+async function fetchTranscript(callId: string): Promise<TranscriptRow[]> {
+  return query<TranscriptRow>(
+    `select id, speaker, content, created_at
+     from transcript_messages
+     where call_id = $1
+     order by created_at asc`,
+    [callId],
+  );
+}
+
 /**
- * The dashboard is single-call focused: this returns the most recently
- * created call (active or otherwise) with its full transcript. The schema
- * supports listing call history later, but the MVP UI never needs it.
+ * Aggregate stats across every completed call. Only 'completed' calls count
+ * — a failed/never-connected call didn't waste any scammer time and would
+ * skew the average downward with a near-zero duration.
+ */
+export async function getDashboardMetrics(): Promise<CallMetrics> {
+  const totals = await queryOne<{ total_calls: number; total_time_wasted_seconds: number }>(
+    `select
+       count(*) filter (where status = 'completed')::int as total_calls,
+       coalesce(sum(duration_seconds) filter (where status = 'completed'), 0)::int as total_time_wasted_seconds
+     from calls`,
+  );
+  const turnsRow = await queryOne<{ total_turns: number }>(
+    `select count(*)::int as total_turns
+     from transcript_messages tm
+     join calls c on c.id = tm.call_id
+     where c.status = 'completed' and tm.speaker != 'system'`,
+  );
+
+  const totalCalls = totals?.total_calls ?? 0;
+  const totalTimeWastedSeconds = totals?.total_time_wasted_seconds ?? 0;
+
+  return {
+    totalCalls,
+    totalTimeWastedSeconds,
+    averageCallSeconds: totalCalls > 0 ? Math.round(totalTimeWastedSeconds / totalCalls) : 0,
+    totalTurns: turnsRow?.total_turns ?? 0,
+  };
+}
+
+interface HistoryRow extends CallRow {
+  created_at: Date;
+  turns: number;
+}
+
+/** Latest `limit` calls of any status, each with a caller+scamsink message count ("turns"). No transcript — fetch that per-call via getCallById. */
+export async function getRecentCalls(limit = 10): Promise<CallHistoryItem[]> {
+  const rows = await query<HistoryRow>(
+    `select
+       c.id, c.twilio_call_sid, c.status, c.direction, c.caller_number_masked,
+       c.started_at, c.ended_at, c.duration_seconds, c.persona, c.created_at,
+       count(tm.id) filter (where tm.speaker != 'system')::int as turns
+     from calls c
+     left join transcript_messages tm on tm.call_id = c.id
+     group by c.id
+     order by c.created_at desc
+     limit $1`,
+    [limit],
+  );
+
+  return rows.map((row) => ({
+    ...toCallSnapshot(row),
+    turns: row.turns,
+    createdAt: row.created_at.toISOString(),
+  }));
+}
+
+/** Single call plus its full transcript — used for the "expand a history row" view. */
+export async function getCallById(id: string): Promise<CallDetail | null> {
+  const call = await queryOne<CallRow>(
+    `select id, twilio_call_sid, status, direction, caller_number_masked, started_at, ended_at, duration_seconds, persona
+     from calls
+     where id = $1`,
+    [id],
+  );
+  if (!call) return null;
+
+  const transcriptRows = await fetchTranscript(call.id);
+  return { call: toCallSnapshot(call), transcript: toTranscript(transcriptRows) };
+}
+
+/**
+ * The dashboard is single-call focused for the "in progress" view: `call`
+ * is the most recently created call (active or otherwise) with its full
+ * transcript. `metrics` and `recentCalls` give the surrounding operations
+ * dashboard its cumulative totals and history.
  */
 export async function getDashboardState(): Promise<DashboardState> {
   const call = await queryOne<CallRow>(
@@ -135,35 +247,19 @@ export async function getDashboardState(): Promise<DashboardState> {
      limit 1`
   );
 
+  const [metrics, recentCalls] = await Promise.all([getDashboardMetrics(), getRecentCalls()]);
+
   if (!call) {
-    return { call: null, transcript: [], serverTimeMs: Date.now() };
+    return { call: null, transcript: [], metrics, recentCalls, serverTimeMs: Date.now() };
   }
 
-  const transcriptRows = await query<TranscriptRow>(
-    `select id, speaker, content, created_at
-     from transcript_messages
-     where call_id = $1
-     order by created_at asc`,
-    [call.id]
-  );
+  const transcriptRows = await fetchTranscript(call.id);
 
   return {
-    call: {
-      id: call.id,
-      status: call.status,
-      direction: call.direction,
-      callerNumberMasked: call.caller_number_masked,
-      startedAt: toIso(call.started_at),
-      endedAt: toIso(call.ended_at),
-      durationSeconds: call.duration_seconds,
-      persona: call.persona,
-    },
-    transcript: transcriptRows.map((row) => ({
-      id: row.id,
-      speaker: row.speaker,
-      content: row.content,
-      createdAt: row.created_at.toISOString(),
-    })),
+    call: toCallSnapshot(call),
+    transcript: toTranscript(transcriptRows),
+    metrics,
+    recentCalls,
     serverTimeMs: Date.now(),
   };
 }

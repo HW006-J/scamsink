@@ -19,6 +19,10 @@ const serverEnvSchema = z.object({
   // only required if the /api/demo/start-call route is actually used.
   DEMO_PHONE_NUMBER: z.string().min(1).optional(),
   DEMO_OPERATOR_SECRET: z.string().min(8).optional(),
+  // Comma-separated E.164 numbers the demo is allowed to call, in addition
+  // to DEMO_PHONE_NUMBER (always implicitly allowed). Optional — if unset,
+  // only DEMO_PHONE_NUMBER can be dialed.
+  DEMO_ALLOWED_PHONE_NUMBERS: z.string().min(1).optional(),
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;

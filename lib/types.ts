@@ -41,28 +41,58 @@ export interface CallEvent {
   createdAt: string;
 }
 
+export interface CallMetrics {
+  totalCalls: number;
+  totalTimeWastedSeconds: number;
+  averageCallSeconds: number;
+  totalTurns: number;
+}
+
+const callSnapshotSchema = z.object({
+  id: z.string(),
+  status: z.enum(CALL_STATUSES),
+  direction: z.enum(CALL_DIRECTIONS),
+  callerNumberMasked: z.string().nullable(),
+  startedAt: z.string().nullable(),
+  endedAt: z.string().nullable(),
+  durationSeconds: z.number().nullable(),
+  persona: z.string(),
+});
+
+const transcriptMessageSchema = z.object({
+  id: z.string(),
+  speaker: z.enum(SPEAKERS),
+  content: z.string(),
+  createdAt: z.string(),
+});
+
+const callMetricsSchema = z.object({
+  totalCalls: z.number(),
+  totalTimeWastedSeconds: z.number(),
+  averageCallSeconds: z.number(),
+  totalTurns: z.number(),
+});
+
+const callHistoryItemSchema = callSnapshotSchema.extend({
+  turns: z.number(),
+  createdAt: z.string(),
+});
+
+export type CallHistoryItem = z.infer<typeof callHistoryItemSchema>;
+
 export const dashboardStateSchema = z.object({
-  call: z
-    .object({
-      id: z.string(),
-      status: z.enum(CALL_STATUSES),
-      direction: z.enum(CALL_DIRECTIONS),
-      callerNumberMasked: z.string().nullable(),
-      startedAt: z.string().nullable(),
-      endedAt: z.string().nullable(),
-      durationSeconds: z.number().nullable(),
-      persona: z.string(),
-    })
-    .nullable(),
-  transcript: z.array(
-    z.object({
-      id: z.string(),
-      speaker: z.enum(SPEAKERS),
-      content: z.string(),
-      createdAt: z.string(),
-    }),
-  ),
+  call: callSnapshotSchema.nullable(),
+  transcript: z.array(transcriptMessageSchema),
+  metrics: callMetricsSchema,
+  recentCalls: z.array(callHistoryItemSchema),
   serverTimeMs: z.number(),
 });
 
 export type DashboardState = z.infer<typeof dashboardStateSchema>;
+
+export const callDetailSchema = z.object({
+  call: callSnapshotSchema,
+  transcript: z.array(transcriptMessageSchema),
+});
+
+export type CallDetail = z.infer<typeof callDetailSchema>;
