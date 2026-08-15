@@ -7,7 +7,7 @@ import {
   recordCallEvent,
 } from "./db.js";
 import { redactSensitiveNumbers } from "./redact.js";
-import { AIProviderError, type AIProvider, type ConversationTurn } from "./ai/index.js";
+import { AIProviderError, boundHistory, type AIProvider, type ConversationTurn } from "./ai/index.js";
 
 const FALLBACK_LINE =
   "Sorry, I'm having a bit of trouble hearing you right now. I'll have to call you back.";
@@ -120,7 +120,7 @@ export class RelaySession {
     let fullReply = "";
 
     try {
-      fullReply = await this.aiProvider.streamReply(this.history, (token) => {
+      fullReply = await this.aiProvider.streamReply(boundHistory(this.history), (token) => {
         if (this.closed || generation !== this.generation) return;
         this.send({ type: "text", token, last: false });
       });

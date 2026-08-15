@@ -66,7 +66,7 @@ The only claim ScamSink makes is the one it can prove: total time spent interact
 │ (Railway/Render/Fly) │   writes      │  call_events        │
 │                       │               └───────────────────┘
 │  WS session per call  │
-│  → Anthropic (Claude) │
+│  → Groq (LLM)         │
 └─────────────────────┘
 ```
 
@@ -91,11 +91,11 @@ The only claim ScamSink makes is the one it can prove: total time spent interact
 - **Neon Postgres**, accessed directly via `pg` (no ORM)
 - **Vitest** for unit tests
 - **Twilio Voice + ConversationRelay** for the phone call and real-time speech/text bridge
-- **Anthropic (Claude)** for the conversational persona, via the official `@anthropic-ai/sdk`
+- **Groq** (`openai/gpt-oss-20b`, via the official `openai` SDK pointed at Groq's OpenAI-compatible endpoint) for the conversational persona; **Anthropic (Claude)** remains supported as an optional fallback provider
 
-### Why Claude Haiku 4.5 for the voice loop
+### Why Groq for the voice loop
 
-The voice server defaults to `claude-haiku-4-5` rather than a larger Claude model. This is a deliberate latency decision, not a cost-cutting one: ScamSink's entire value proposition depends on the gap between *"caller finishes speaking"* and *"ScamSink starts speaking back"* staying short enough to feel like a real phone call. Haiku's response latency is the best fit for that constraint. The model is fully configurable via `ANTHROPIC_MODEL` if you want to trade latency for a more capable model.
+The voice server defaults to Groq's `openai/gpt-oss-20b` rather than a larger, slower model. This is a deliberate latency decision: ScamSink's entire value proposition depends on the gap between *"caller finishes speaking"* and *"ScamSink starts speaking back"* staying short enough to feel like a real phone call, and Groq's inference is currently among the fastest available for a model this capable (~1000 tokens/sec). ScamSink also doesn't need deep reasoning — one short, natural reply per caller turn — which plays to Groq's strengths. Its free tier (30 requests/min, 8K tokens/min for this model) comfortably covers a full demo call. The provider is swappable via `AI_PROVIDER=groq|anthropic`; only the selected provider's API key is required.
 
 ## Twilio architecture
 
@@ -119,8 +119,8 @@ Inbound call flow, using the current (2026) Twilio Voice API:
 `voice-server/` is a standalone Node process (own `package.json`, deployed independently):
 
 - `src/index.ts` — HTTP server (health check) + WebSocket upgrade handling. Verifies the per-call relay token before accepting a connection.
-- `src/relay-session.ts` — one instance per phone call. Parses inbound ConversationRelay messages, maintains conversation history, calls the AI provider, streams the reply back token-by-token, and persists the transcript.
-- `src/ai/` — provider abstraction (`AIProvider` interface) with an Anthropic implementation. Selected via `AI_PROVIDER`. Throws rather than fabricating a response if the provider is unavailable.
+- `src/relay-session.ts` — one instance per phone call. Parses inbound ConversationRelay messages, maintains conversation history, calls the AI provider, streams the reply back token-by-token, and persists the transcript. Only the most recent `MAX_HISTORY_MESSAGES` (20) turns are sent to the provider each request — the full transcript still persists to Postgres regardless.
+- `src/ai/` — provider abstraction (`AIProvider` interface) with `GroqProvider` (production default) and `AnthropicProvider` (optional) implementations, selected via `AI_PROVIDER`. Throws rather than fabricating a response if the provider is unavailable, times out, or is rate-limited.
 - `src/persona.ts` — the system prompt (see below).
 - `src/db.ts` — direct Postgres access (connection pool), independent of the Next.js app's copy.
 - `src/redact.ts` — best-effort redaction of obvious sensitive numeric strings before anything is persisted.
@@ -157,7 +157,7 @@ See `.env.example` (Next.js app) and `voice-server/.env.example` (voice server) 
 `DATABASE_URL`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `PUBLIC_APP_URL`, `VOICE_SERVER_URL`, `VOICE_SERVER_SHARED_SECRET`
 
 **voice-server** (Railway/Render/Fly):
-`DATABASE_URL`, `TWILIO_AUTH_TOKEN`, `PUBLIC_APP_URL`, `VOICE_SERVER_SHARED_SECRET`, `AI_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `PORT`
+`DATABASE_URL`, `TWILIO_AUTH_TOKEN`, `PUBLIC_APP_URL`, `VOICE_SERVER_SHARED_SECRET`, `AI_PROVIDER` (`groq` by default), `GROQ_API_KEY`, `GROQ_MODEL`, `PORT` — plus `ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` only if `AI_PROVIDER=anthropic`
 
 `VOICE_SERVER_SHARED_SECRET` must be identical on both sides — generate one with `openssl rand -hex 32`.
 

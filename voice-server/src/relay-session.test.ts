@@ -165,4 +165,26 @@ describe("RelaySession", () => {
 
     expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
   });
+
+  it("bounds the history sent to the AI provider even as the call runs long", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({ id: "call-1", status: "active" });
+    const streamReply = vi.fn(async (_history, onToken: (t: string) => void) => {
+      onToken("ok");
+      return "ok";
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await flush();
+
+    for (let i = 0; i < 25; i++) {
+      ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: `turn ${i}`, last: true }));
+      await flush();
+    }
+
+    expect(streamReply).toHaveBeenCalledTimes(25);
+    const lastCallHistory = streamReply.mock.calls[24][0] as unknown[];
+    expect(lastCallHistory.length).toBeLessThanOrEqual(20);
+  });
 });
