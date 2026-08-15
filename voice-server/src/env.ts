@@ -11,21 +11,24 @@ import { z } from "zod";
  */
 const envSchema = z
   .object({
-    DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
-    TWILIO_AUTH_TOKEN: z.string().min(1, "TWILIO_AUTH_TOKEN is required"),
+    DATABASE_URL: z.string().trim().min(1, "DATABASE_URL is required"),
+    TWILIO_AUTH_TOKEN: z.string().trim().min(1, "TWILIO_AUTH_TOKEN is required"),
     VOICE_SERVER_SHARED_SECRET: z
       .string()
+      .trim()
       .min(16, "VOICE_SERVER_SHARED_SECRET must be at least 16 characters"),
-    PUBLIC_APP_URL: z.string().url("PUBLIC_APP_URL must be a valid URL"),
+    PUBLIC_APP_URL: z.string().trim().url("PUBLIC_APP_URL must be a valid URL"),
     AI_PROVIDER: z.enum(["groq", "anthropic"]).default("groq"),
     // Fast, low-latency, generous free tier — the production default for the
     // live voice loop. Optional at the schema level; required in practice
-    // when AI_PROVIDER=groq (enforced below).
-    GROQ_API_KEY: z.string().min(1).optional(),
-    GROQ_MODEL: z.string().min(1).default("openai/gpt-oss-20b"),
+    // when AI_PROVIDER=groq (enforced below). Trimmed defensively: a stray
+    // trailing newline/space from a copy-paste into a platform's secret
+    // form is a common, hard-to-spot cause of "invalid API key" errors.
+    GROQ_API_KEY: z.string().trim().min(1).optional(),
+    GROQ_MODEL: z.string().trim().min(1).default("openai/gpt-oss-20b"),
     // Optional legacy/fallback provider — no longer required for production.
-    ANTHROPIC_API_KEY: z.string().min(1).optional(),
-    ANTHROPIC_MODEL: z.string().min(1).default("claude-haiku-4-5"),
+    ANTHROPIC_API_KEY: z.string().trim().min(1).optional(),
+    ANTHROPIC_MODEL: z.string().trim().min(1).default("claude-haiku-4-5"),
     PORT: z.coerce.number().int().positive().default(8080),
   })
   .superRefine((env, ctx) => {

@@ -73,4 +73,15 @@ describe("loadEnv", () => {
     process.env.GROQ_API_KEY = "gsk_test";
     expect(() => loadEnv()).toThrow();
   });
+
+  it("trims stray whitespace from GROQ_API_KEY (a common copy-paste artifact)", () => {
+    process.env.GROQ_API_KEY = "  gsk_test_with_padding \n";
+    expect(loadEnv().GROQ_API_KEY).toBe("gsk_test_with_padding");
+  });
+
+  it("trims stray whitespace from VOICE_SERVER_SHARED_SECRET", () => {
+    process.env.GROQ_API_KEY = "gsk_test";
+    process.env.VOICE_SERVER_SHARED_SECRET = "  a-very-long-shared-secret-value\n";
+    expect(loadEnv().VOICE_SERVER_SHARED_SECRET).toBe("a-very-long-shared-secret-value");
+  });
 });
