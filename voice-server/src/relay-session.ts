@@ -14,6 +14,14 @@ import {
   INITIAL_DEMO_SCRIPT_STATE,
   type DemoScriptState,
 } from "./demoScript.js";
+import {
+  advanceInfraScript,
+  INFRA_SCRIPT_FALLBACK_LINE,
+  INITIAL_INFRA_SCRIPT_STATE,
+  type InfraScriptState,
+} from "./infraScript.js";
+
+type ScriptMode = "none" | "scam_honeypot" | "infrastructure_simulation";
 
 const FALLBACK_LINE =
   "Sorry, I'm having a bit of trouble hearing you right now. I'll have to call you back.";
@@ -39,11 +47,14 @@ export class RelaySession {
   private history: ConversationTurn[] = [];
   private closed = false;
   private generation = 0;
-  // Outbound demo calls follow a deterministic comedy script instead of
-  // free-form Groq replies, decided once at setup from the call's
-  // direction and never changed mid-call.
-  private demoScriptMode = false;
+  // Outbound demo calls follow one of two deterministic comedy scripts
+  // instead of free-form Groq replies, decided once at setup from the
+  // call's direction + demo_mode and never changed mid-call. Each
+  // RelaySession is one WS connection per call, so this state is
+  // inherently isolated per call — no cross-call sharing is possible.
+  private scriptMode: ScriptMode = "none";
   private scriptState: DemoScriptState = INITIAL_DEMO_SCRIPT_STATE;
+  private infraScriptState: InfraScriptState = INITIAL_INFRA_SCRIPT_STATE;
 
   constructor(
     private readonly ws: WebSocket,
@@ -111,7 +122,12 @@ export class RelaySession {
     }
 
     this.callId = call.id;
-    this.demoScriptMode = call.direction === "outbound_demo";
+    this.scriptMode =
+      call.direction === "outbound_demo"
+        ? call.demoMode === "infrastructure_simulation"
+          ? "infrastructure_simulation"
+          : "scam_honeypot"
+        : "none";
     await Promise.all([
       markCallActive(message.callSid),
       recordCallEvent(call.id, "voice_server_connected"),
@@ -130,8 +146,12 @@ export class RelaySession {
 
     const generation = this.generation;
 
-    if (this.demoScriptMode) {
+    if (this.scriptMode === "scam_honeypot") {
       await this.handleScriptedPrompt(redacted, generation);
+      return;
+    }
+    if (this.scriptMode === "infrastructure_simulation") {
+      await this.handleInfraScriptedPrompt(redacted, generation);
       return;
     }
 
@@ -199,6 +219,42 @@ export class RelaySession {
     } catch (err) {
       console.error("[relay] demo script state machine failed, using safe fallback:", err);
       line = DEMO_SCRIPT_FALLBACK_LINE;
+    }
+
+    if (this.closed || generation !== this.generation) return;
+
+    this.send({ type: "text", token: line, last: true });
+
+    if (this.callId) {
+      await appendTranscriptMessage(this.callId, "scamsink", line).catch((err) =>
+        console.error("[relay] failed to persist scamsink transcript", err),
+      );
+    }
+  }
+
+  /**
+   * Deterministic reply path for "CRITICAL INFRASTRUCTURE SIMULATION" demo
+   * calls. Same shape and same guarantees as handleScriptedPrompt: pure,
+   * synchronous state machine, no network call that can hang, and a reply
+   * is always sent unless the caller has already interrupted or the
+   * connection is closed.
+   */
+  private async handleInfraScriptedPrompt(humanText: string, generation: number): Promise<void> {
+    let line: string;
+    try {
+      const result = advanceInfraScript(this.infraScriptState, humanText);
+      this.infraScriptState = result.nextState;
+      line = result.line;
+      if (this.callId) {
+        await recordCallEvent(this.callId, "infra_script_turn", {
+          fromIndex: result.transition.fromIndex,
+          toIndex: result.transition.toIndex,
+          matched: result.transition.matched,
+        }).catch(() => {});
+      }
+    } catch (err) {
+      console.error("[relay] infra script state machine failed, using safe fallback:", err);
+      line = INFRA_SCRIPT_FALLBACK_LINE;
     }
 
     if (this.closed || generation !== this.generation) return;

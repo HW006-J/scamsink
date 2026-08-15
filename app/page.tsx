@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { formatDurationLong, formatDurationShort, formatTimerClock } from "@/lib/duration";
-import type { CallDetail, CallHistoryItem, CallMetrics, CallStatus, DashboardState } from "@/lib/types";
+import type { CallDetail, CallHistoryItem, CallMetrics, CallStatus, DashboardState, DemoMode } from "@/lib/types";
 
 const POLL_INTERVAL_MS = 1000;
 // Mirrors lib/demoAuth.ts's DEMO_SECRET_HEADER — kept as a plain literal here
@@ -105,7 +105,7 @@ function useDemoCall() {
   const [state, setState] = useState<DemoCallState>({ kind: "idle" });
   const inFlightRef = useRef(false);
 
-  const startDemoCall = useCallback(async (to: string) => {
+  const startDemoCall = useCallback(async (to: string, mode: DemoMode) => {
     if (inFlightRef.current) return;
 
     let secret = window.sessionStorage.getItem(DEMO_SECRET_STORAGE_KEY);
@@ -121,7 +121,7 @@ function useDemoCall() {
       const res = await fetch("/api/demo/start-call", {
         method: "POST",
         headers: { [DEMO_SECRET_HEADER]: secret, "content-type": "application/json" },
-        body: JSON.stringify({ to }),
+        body: JSON.stringify({ to, mode }),
       });
 
       if (res.status === 401) {
@@ -275,6 +275,37 @@ function MetricsBar({ metrics }: { metrics: CallMetrics }) {
   );
 }
 
+/** Only rendered once a real infrastructure-simulation call has completed — never shows an empty/all-zero panel by default. */
+function SimulationMetricsBar({ metrics }: { metrics: CallMetrics }) {
+  return (
+    <div className="flex flex-col items-center gap-4 border-b border-border-subtle bg-surface px-8 py-8 text-center sm:px-12">
+      <p className="text-xs uppercase tracking-[0.3em] text-muted">Critical infrastructure simulation</p>
+      <div>
+        <p className="font-mono text-4xl font-semibold tabular-nums text-accent-red sm:text-5xl">
+          {formatTimerClock(metrics.totalTimeWastedSeconds)}
+        </p>
+        <p className="mt-1 text-xs uppercase tracking-[0.2em] text-muted">Simulated adversary time diverted</p>
+      </div>
+      <div className="flex flex-wrap items-center justify-center gap-x-10 gap-y-2 text-sm">
+        <div>
+          <span className="font-mono text-lg text-foreground">{metrics.totalCalls}</span>{" "}
+          <span className="uppercase tracking-wide text-muted">simulation calls</span>
+        </div>
+        <div>
+          <span className="font-mono text-lg text-foreground">
+            {formatDurationShort(metrics.averageCallSeconds)}
+          </span>{" "}
+          <span className="uppercase tracking-wide text-muted">avg engagement</span>
+        </div>
+        <div>
+          <span className="font-mono text-lg text-foreground">{metrics.totalTurns}</span>{" "}
+          <span className="uppercase tracking-wide text-muted">turns</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TranscriptPanel({ transcript }: { transcript: DashboardState["transcript"] }) {
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -337,6 +368,36 @@ function TranscriptPanel({ transcript }: { transcript: DashboardState["transcrip
   );
 }
 
+const MODE_LABELS: Record<DemoMode, string> = {
+  scam_honeypot: "Scam honeypot",
+  infrastructure_simulation: "Infrastructure simulation",
+};
+
+function ModeToggle({ mode, onChange, disabled }: { mode: DemoMode; onChange: (mode: DemoMode) => void; disabled: boolean }) {
+  return (
+    <div className="flex gap-2">
+      {(Object.keys(MODE_LABELS) as DemoMode[]).map((option) => {
+        const active = option === mode;
+        return (
+          <button
+            key={option}
+            type="button"
+            disabled={disabled}
+            onClick={() => onChange(option)}
+            className={`flex-1 rounded-md border px-3 py-2 text-xs font-semibold uppercase tracking-wide transition disabled:cursor-not-allowed disabled:opacity-50 ${
+              active
+                ? "border-accent-red bg-accent-red/10 text-accent-red"
+                : "border-border-subtle text-muted hover:border-accent-red/50 hover:text-foreground"
+            }`}
+          >
+            {MODE_LABELS[option]}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function StartCallView({
   demoCallConfigured,
   demoState,
@@ -344,15 +405,16 @@ function StartCallView({
 }: {
   demoCallConfigured: boolean;
   demoState: DemoCallState;
-  onStartDemoCall: (to: string) => void;
+  onStartDemoCall: (to: string, mode: DemoMode) => void;
 }) {
   const [phoneValue, setPhoneValue] = useState("");
+  const [mode, setMode] = useState<DemoMode>("scam_honeypot");
   const starting = demoState.kind === "starting";
 
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
     if (!phoneValue.trim() || starting) return;
-    onStartDemoCall(phoneValue);
+    onStartDemoCall(phoneValue, mode);
   }
 
   return (
@@ -361,6 +423,10 @@ function StartCallView({
         <p className="text-center text-xs uppercase tracking-[0.3em] text-muted">Start a ScamSink call</p>
         {demoCallConfigured ? (
           <form onSubmit={handleSubmit} className="mt-6 flex flex-col gap-4">
+            <div className="flex flex-col gap-2">
+              <span className="text-xs uppercase tracking-[0.2em] text-muted">Mode</span>
+              <ModeToggle mode={mode} onChange={setMode} disabled={starting} />
+            </div>
             <label className="flex flex-col gap-2 text-left">
               <span className="text-xs uppercase tracking-[0.2em] text-muted">Phone number</span>
               <input
@@ -392,16 +458,18 @@ function StartCallView({
   );
 }
 
-function DemoBadge() {
+function DemoBadge({ demoMode }: { demoMode: DemoMode | null }) {
+  const label = demoMode === "infrastructure_simulation" ? "Infrastructure simulation" : "Demo call";
   return (
     <span className="rounded border border-border-subtle px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted">
-      Demo call
+      {label}
     </span>
   );
 }
 
 function LiveView({ data, nowMs }: { data: DashboardState; nowMs: number }) {
   const call = data.call!;
+  const isSimulation = call.demoMode === "infrastructure_simulation";
   const clockSkewMs = nowMs - data.serverTimeMs;
   const startedAtMs = call.startedAt ? new Date(call.startedAt).getTime() : nowMs;
   const elapsedSeconds = Math.max(0, Math.floor((nowMs - clockSkewMs - startedAtMs) / 1000));
@@ -409,9 +477,16 @@ function LiveView({ data, nowMs }: { data: DashboardState; nowMs: number }) {
 
   return (
     <div className="flex flex-1 flex-col gap-8 px-8 py-8 sm:px-12">
+      {isSimulation && (
+        <p className="text-center text-xs font-semibold uppercase tracking-[0.3em] text-accent-red">
+          Critical infrastructure simulation
+        </p>
+      )}
       <div className="flex flex-wrap items-end justify-between gap-6">
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-muted">Live call — time wasted</p>
+          <p className="text-xs uppercase tracking-[0.3em] text-muted">
+            {isSimulation ? "Simulated adversary time diverted" : "Live call — time wasted"}
+          </p>
           <p className="mt-2 font-mono text-6xl font-semibold tabular-nums text-accent-red sm:text-7xl">
             {formatTimerClock(elapsedSeconds)}
           </p>
@@ -422,7 +497,7 @@ function LiveView({ data, nowMs }: { data: DashboardState; nowMs: number }) {
             <p className="mt-1 font-mono text-lg">{call.callerNumberMasked ?? "Unknown"}</p>
             {call.direction === "outbound_demo" && (
               <div className="mt-1 flex justify-end">
-                <DemoBadge />
+                <DemoBadge demoMode={call.demoMode} />
               </div>
             )}
           </div>
@@ -449,21 +524,29 @@ function LiveView({ data, nowMs }: { data: DashboardState; nowMs: number }) {
 
 function CompletedView({ data, onCallAgain }: { data: DashboardState; onCallAgain: () => void }) {
   const call = data.call!;
+  const isSimulation = call.demoMode === "infrastructure_simulation";
   const durationSeconds = call.durationSeconds ?? 0;
   const turnCount = data.transcript.filter((m) => m.speaker !== "system").length;
 
   return (
     <div className="flex flex-1 flex-col gap-8 px-8 py-8 sm:px-12">
+      {isSimulation && (
+        <p className="text-center text-xs font-semibold uppercase tracking-[0.3em] text-accent-red">
+          Critical infrastructure simulation
+        </p>
+      )}
       <div className="flex flex-wrap items-end justify-between gap-6">
         <div>
           <p className="text-xs uppercase tracking-[0.3em] text-muted">Call complete</p>
           <p className="mt-2 font-mono text-6xl font-semibold tabular-nums text-accent-green sm:text-7xl">
             {formatDurationShort(durationSeconds)}
           </p>
-          <p className="mt-1 text-xs uppercase tracking-[0.2em] text-muted">Time wasted</p>
+          <p className="mt-1 text-xs uppercase tracking-[0.2em] text-muted">
+            {isSimulation ? "Simulated adversary time diverted" : "Time wasted"}
+          </p>
         </div>
         <div className="max-w-sm text-right text-sm text-muted">
-          Caller kept away from potential victims for:
+          {isSimulation ? "Simulated adversary kept engaged for:" : "Caller kept away from potential victims for:"}
           <br />
           <span className="text-foreground">{formatDurationLong(durationSeconds)}</span>
         </div>
@@ -475,7 +558,7 @@ function CompletedView({ data, onCallAgain }: { data: DashboardState; onCallAgai
           <p className="mt-1 font-mono">{call.callerNumberMasked ?? "Unknown"}</p>
           {call.direction === "outbound_demo" && (
             <div className="mt-1">
-              <DemoBadge />
+              <DemoBadge demoMode={call.demoMode} />
             </div>
           )}
         </div>
@@ -549,6 +632,9 @@ function HistoryRow({ call, expanded, onToggle }: { call: CallHistoryItem; expan
         <span className="font-mono">{call.callerNumberMasked ?? "Unknown"}</span>
         <span className="font-mono text-muted">{formatDurationShort(call.durationSeconds ?? 0)}</span>
         <span className="font-mono text-muted">{call.turns} turns</span>
+        {call.demoMode === "infrastructure_simulation" && (
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-accent-red">Simulation</span>
+        )}
         <span className={`text-xs font-semibold uppercase tracking-wide ${statusTextColor(call.status)}`}>
           {call.status}
         </span>
@@ -662,6 +748,9 @@ export default function DashboardPage() {
     <div className="flex min-h-screen flex-1 flex-col">
       <Header statusNode={statusNode} />
       {state.kind === "ok" && <MetricsBar metrics={state.data.metrics} />}
+      {state.kind === "ok" && state.data.simulationMetrics.totalCalls > 0 && (
+        <SimulationMetricsBar metrics={state.data.simulationMetrics} />
+      )}
       {body}
       {state.kind === "ok" && <RecentCallsList calls={state.data.recentCalls} />}
     </div>

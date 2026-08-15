@@ -5,7 +5,7 @@ import { isAuthorizedDemoOperator } from "@/lib/demoAuth";
 import { getServerEnv } from "@/lib/env";
 import { maskPhoneNumber } from "@/lib/mask";
 import { isAllowedDemoDestination, normalizePhoneNumberToE164, parseAllowedPhoneNumbers } from "@/lib/phone";
-import { PERSONA_DEFAULT } from "@/lib/types";
+import { DEMO_MODES, PERSONA_DEFAULT, type DemoMode } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -46,6 +46,9 @@ export async function POST(request: Request) {
       { status: 400 },
     );
   }
+
+  const requestedMode = (body as { mode?: unknown } | null)?.mode;
+  const demoMode: DemoMode = DEMO_MODES.includes(requestedMode as DemoMode) ? (requestedMode as DemoMode) : "scam_honeypot";
 
   // The operator's own configured demo number is always allowed, on top of
   // whatever else is explicitly allowlisted. Client input never determines
@@ -111,6 +114,7 @@ export async function POST(request: Request) {
       callerNumberMasked: maskPhoneNumber(normalizedTo),
       persona: PERSONA_DEFAULT,
       direction: "outbound_demo",
+      demoMode,
     });
   } catch (error) {
     // The call is already ringing on the phone at this point — log and

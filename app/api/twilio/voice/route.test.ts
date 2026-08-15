@@ -126,7 +126,7 @@ describe("POST /api/twilio/voice", () => {
   });
 
   it("does not re-create (and cannot clobber) a call row already created by /api/demo/start-call", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({ id: "existing-call-id", status: "ringing" });
+    getCallByTwilioSidMock.mockResolvedValue({ id: "existing-call-id", status: "ringing", demoMode: null });
     readVerifiedTwilioRequestMock.mockResolvedValue({
       CallSid: "CAoutbound",
       From: "+12184293208",
@@ -140,5 +140,60 @@ describe("POST /api/twilio/voice", () => {
     expect(res.status).toBe(200);
     expect(xml).toContain("<ConversationRelay");
     expect(createCallMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the infrastructure-simulation opening line as welcomeGreeting when demo_mode is infrastructure_simulation", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "existing-call-id",
+      status: "ringing",
+      demoMode: "infrastructure_simulation",
+    });
+    readVerifiedTwilioRequestMock.mockResolvedValue({
+      CallSid: "CAinfra",
+      From: "+12184293208",
+      To: "+447700900000",
+      Direction: "outbound-api",
+    });
+
+    const res = await POST(makeRequest("CallSid=CAinfra"));
+    const xml = await res.text();
+
+    expect(xml).toContain("welcomeGreeting=");
+    expect(xml).toContain("Hi, I need some parts urgently to repair five drones");
+    expect(xml).not.toContain("Hello? Sorry, who&apos;s calling?");
+  });
+
+  it("uses the default greeting (bot does NOT speak first) for scam_honeypot calls", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "existing-call-id",
+      status: "ringing",
+      demoMode: "scam_honeypot",
+    });
+    readVerifiedTwilioRequestMock.mockResolvedValue({
+      CallSid: "CAhoneypot",
+      From: "+12184293208",
+      To: "+447700900000",
+      Direction: "outbound-api",
+    });
+
+    const res = await POST(makeRequest("CallSid=CAhoneypot"));
+    const xml = await res.text();
+
+    expect(xml).not.toContain("Hi, I need some parts urgently");
+    expect(xml).toContain("who");
+  });
+
+  it("uses the default greeting for a genuine new inbound call (never a demo mode)", async () => {
+    readVerifiedTwilioRequestMock.mockResolvedValue({
+      CallSid: "CAinbound",
+      From: "+15551234567",
+      To: "+12184293208",
+      Direction: "inbound",
+    });
+
+    const res = await POST(makeRequest("CallSid=CAinbound"));
+    const xml = await res.text();
+
+    expect(xml).not.toContain("Hi, I need some parts urgently");
   });
 });

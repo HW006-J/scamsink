@@ -317,3 +317,210 @@ describe("RelaySession — demo script mode (outbound_demo calls)", () => {
     expect(ws.sent.filter((m) => m.type === "text")).toHaveLength(0);
   });
 });
+
+describe("RelaySession — infrastructure simulation mode", () => {
+  beforeEach(() => {
+    getCallByTwilioSidMock.mockReset();
+    markCallActiveMock.mockReset().mockResolvedValue(undefined);
+    markCallEndedMock.mockReset().mockResolvedValue(undefined);
+    appendTranscriptMessageMock.mockReset().mockResolvedValue(undefined);
+    recordCallEventMock.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("uses the infra script instead of the AI provider or the scam-honeypot script", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "infrastructure_simulation",
+    });
+    const streamReply = vi.fn();
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await flush();
+    ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Yes, sure, I can help.", last: true }));
+    await flush();
+
+    expect(streamReply).not.toHaveBeenCalled();
+    const textMessages = ws.sent.filter((m) => m.type === "text");
+    expect(textMessages).toHaveLength(1);
+    expect(textMessages[0].token).toContain("delivery information written down somewhere");
+    expect(appendTranscriptMessageMock).toHaveBeenCalledWith(
+      "call-1",
+      "scamsink",
+      expect.stringContaining("delivery information"),
+    );
+  });
+
+  it("advances through multiple infra states across turns and never goes silent", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "infrastructure_simulation",
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await flush();
+
+    const turns = [
+      "Yes, sounds good, where should I deliver them?",
+      "How urgent is it?",
+      "Do you need an invoice?",
+      "What's your company name and delivery address?",
+      "Okay, go on then.",
+      "Anything else, gibberish nonsense",
+    ];
+    for (const voicePrompt of turns) {
+      ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt, last: true }));
+      await flush();
+    }
+
+    const textMessages = ws.sent.filter((m) => m.type === "text");
+    expect(textMessages).toHaveLength(turns.length);
+    for (const msg of textMessages) {
+      expect(typeof msg.token).toBe("string");
+      expect((msg.token as string).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("records infra_script_turn events, distinct from demo_script_turn", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "infrastructure_simulation",
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await flush();
+    ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Yes, I can help.", last: true }));
+    await flush();
+
+    expect(recordCallEventMock).toHaveBeenCalledWith(
+      "call-1",
+      "infra_script_turn",
+      expect.objectContaining({ fromIndex: 1, toIndex: 2, matched: true }),
+    );
+  });
+
+  it("falls back to scam_honeypot script when direction is outbound_demo with no demoMode set (legacy rows)", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: null,
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await flush();
+    ws.emit(
+      "message",
+      JSON.stringify({ type: "prompt", voicePrompt: "You've won £1000, do you have your card?", last: true }),
+    );
+    await flush();
+
+    const textMessages = ws.sent.filter((m) => m.type === "text");
+    expect(textMessages[0]).toMatchObject({ token: "Oh wow, really? Yeah, one second, I'll go and get it." });
+  });
+});
+
+describe("RelaySession — mode isolation across concurrent calls", () => {
+  beforeEach(() => {
+    getCallByTwilioSidMock.mockReset();
+    markCallActiveMock.mockReset().mockResolvedValue(undefined);
+    markCallEndedMock.mockReset().mockResolvedValue(undefined);
+    appendTranscriptMessageMock.mockReset().mockResolvedValue(undefined);
+    recordCallEventMock.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("two simultaneous sessions in different modes never leak state into each other", async () => {
+    const lookups: Record<string, unknown> = {
+      CAHONEYPOT: { id: "call-honeypot", status: "active", direction: "outbound_demo", demoMode: "scam_honeypot" },
+      CAINFRA: { id: "call-infra", status: "active", direction: "outbound_demo", demoMode: "infrastructure_simulation" },
+      CAINBOUND: { id: "call-inbound", status: "active", direction: "inbound", demoMode: null },
+    };
+    getCallByTwilioSidMock.mockImplementation((sid: string) => Promise.resolve(lookups[sid] ?? null));
+
+    const streamReply = vi.fn(async (_h, onToken: (t: string) => void) => {
+      onToken("dynamic reply");
+      return "dynamic reply";
+    });
+
+    const wsHoneypot = new FakeWebSocket();
+    const wsInfra = new FakeWebSocket();
+    const wsInbound = new FakeWebSocket();
+    new RelaySession(wsHoneypot as never, { streamReply } as unknown as AIProvider);
+    new RelaySession(wsInfra as never, { streamReply } as unknown as AIProvider);
+    new RelaySession(wsInbound as never, { streamReply } as unknown as AIProvider);
+
+    wsHoneypot.emit("message", JSON.stringify({ type: "setup", callSid: "CAHONEYPOT" }));
+    wsInfra.emit("message", JSON.stringify({ type: "setup", callSid: "CAINFRA" }));
+    wsInbound.emit("message", JSON.stringify({ type: "setup", callSid: "CAINBOUND" }));
+    await flush();
+
+    // Interleave prompts across all three sessions in the same tick.
+    wsHoneypot.emit(
+      "message",
+      JSON.stringify({ type: "prompt", voicePrompt: "You've won £1000, do you have your card?", last: true }),
+    );
+    wsInfra.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Yes, I can help.", last: true }));
+    wsInbound.emit("message", JSON.stringify({ type: "prompt", voicePrompt: "Hello?", last: true }));
+    await flush();
+
+    const honeypotText = wsHoneypot.sent.filter((m) => m.type === "text");
+    const infraText = wsInfra.sent.filter((m) => m.type === "text");
+    const inboundText = wsInbound.sent.filter((m) => m.type === "text");
+
+    expect(honeypotText[0]).toMatchObject({ token: "Oh wow, really? Yeah, one second, I'll go and get it." });
+    expect(infraText[0].token).toContain("delivery information written down somewhere");
+    expect(inboundText[0]).toMatchObject({ token: "dynamic reply" });
+    // The AI provider was only ever invoked for the real inbound call.
+    expect(streamReply).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("RelaySession — rapid speech cannot wedge the state", () => {
+  beforeEach(() => {
+    getCallByTwilioSidMock.mockReset();
+    markCallActiveMock.mockReset().mockResolvedValue(undefined);
+    markCallEndedMock.mockReset().mockResolvedValue(undefined);
+    appendTranscriptMessageMock.mockReset().mockResolvedValue(undefined);
+    recordCallEventMock.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("firing many prompts back-to-back without waiting between them still produces one reply per turn, in order", async () => {
+    getCallByTwilioSidMock.mockResolvedValue({
+      id: "call-1",
+      status: "active",
+      direction: "outbound_demo",
+      demoMode: "infrastructure_simulation",
+    });
+    const ws = new FakeWebSocket();
+    new RelaySession(ws as never, { streamReply: vi.fn() } as unknown as AIProvider);
+
+    ws.emit("message", JSON.stringify({ type: "setup", callSid: "CAxxxx" }));
+    await flush();
+
+    // Fire 10 prompts in immediate succession, with no await between emits.
+    for (let i = 0; i < 10; i++) {
+      ws.emit("message", JSON.stringify({ type: "prompt", voicePrompt: `rapid turn ${i}`, last: true }));
+    }
+    await flush();
+    await flush();
+
+    const textMessages = ws.sent.filter((m) => m.type === "text");
+    expect(textMessages).toHaveLength(10);
+    for (const msg of textMessages) {
+      expect((msg.token as string).length).toBeGreaterThan(0);
+    }
+  });
+});

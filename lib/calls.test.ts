@@ -7,7 +7,13 @@ const { queryMock, queryOneMock } = vi.hoisted(() => ({
 
 vi.mock("./db", () => ({ query: queryMock, queryOne: queryOneMock }));
 
-import { getCallById, getDashboardMetrics, getMostRecentDemoCallCreatedAt, getRecentCalls } from "./calls";
+import {
+  getCallById,
+  getDashboardMetrics,
+  getMostRecentDemoCallCreatedAt,
+  getRecentCalls,
+  getSimulationMetrics,
+} from "./calls";
 
 describe("getDashboardMetrics", () => {
   beforeEach(() => {
@@ -27,6 +33,17 @@ describe("getDashboardMetrics", () => {
       averageCallSeconds: 46,
       totalTurns: 31,
     });
+  });
+
+  it("excludes infrastructure_simulation calls from the query", async () => {
+    queryOneMock
+      .mockResolvedValueOnce({ total_calls: 0, total_time_wasted_seconds: 0 })
+      .mockResolvedValueOnce({ total_turns: 0 });
+
+    await getDashboardMetrics();
+
+    expect(queryOneMock).toHaveBeenNthCalledWith(1, expect.stringContaining("infrastructure_simulation"));
+    expect(queryOneMock).toHaveBeenNthCalledWith(2, expect.stringContaining("infrastructure_simulation"));
   });
 
   it("returns all-zero metrics when there are no completed calls", async () => {
@@ -58,6 +75,38 @@ describe("getDashboardMetrics", () => {
   });
 });
 
+describe("getSimulationMetrics", () => {
+  beforeEach(() => {
+    queryOneMock.mockReset();
+  });
+
+  it("computes totals scoped to infrastructure_simulation calls only", async () => {
+    queryOneMock
+      .mockResolvedValueOnce({ total_calls: 2, total_time_wasted_seconds: 202 })
+      .mockResolvedValueOnce({ total_turns: 10 });
+
+    const metrics = await getSimulationMetrics();
+
+    expect(metrics).toEqual({
+      totalCalls: 2,
+      totalTimeWastedSeconds: 202,
+      averageCallSeconds: 101,
+      totalTurns: 10,
+    });
+    expect(queryOneMock).toHaveBeenNthCalledWith(1, expect.stringContaining("demo_mode = 'infrastructure_simulation'"));
+  });
+
+  it("returns all-zero metrics when there are no simulation calls yet (never fakes numbers)", async () => {
+    queryOneMock
+      .mockResolvedValueOnce({ total_calls: 0, total_time_wasted_seconds: 0 })
+      .mockResolvedValueOnce({ total_turns: 0 });
+
+    const metrics = await getSimulationMetrics();
+
+    expect(metrics).toEqual({ totalCalls: 0, totalTimeWastedSeconds: 0, averageCallSeconds: 0, totalTurns: 0 });
+  });
+});
+
 describe("getRecentCalls", () => {
   beforeEach(() => {
     queryMock.mockReset();
@@ -70,6 +119,7 @@ describe("getRecentCalls", () => {
         twilio_call_sid: "CA1",
         status: "completed",
         direction: "outbound_demo",
+        demo_mode: "infrastructure_simulation",
         caller_number_masked: "+44 **** **60",
         started_at: new Date("2026-08-15T14:48:00.000Z"),
         ended_at: new Date("2026-08-15T14:48:32.000Z"),
@@ -87,6 +137,7 @@ describe("getRecentCalls", () => {
         id: "call-1",
         status: "completed",
         direction: "outbound_demo",
+        demoMode: "infrastructure_simulation",
         callerNumberMasked: "+44 **** **60",
         startedAt: "2026-08-15T14:48:00.000Z",
         endedAt: "2026-08-15T14:48:32.000Z",
@@ -125,6 +176,7 @@ describe("getCallById", () => {
       twilio_call_sid: "CA1",
       status: "completed",
       direction: "outbound_demo",
+      demo_mode: "scam_honeypot",
       caller_number_masked: "+44 **** **60",
       started_at: new Date("2026-08-15T14:48:00.000Z"),
       ended_at: new Date("2026-08-15T14:48:32.000Z"),
@@ -147,6 +199,7 @@ describe("getCallById", () => {
         id: "call-1",
         status: "completed",
         direction: "outbound_demo",
+        demoMode: "scam_honeypot",
         callerNumberMasked: "+44 **** **60",
         startedAt: "2026-08-15T14:48:00.000Z",
         endedAt: "2026-08-15T14:48:32.000Z",

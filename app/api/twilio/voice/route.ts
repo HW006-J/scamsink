@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createCall, getCallByTwilioSid } from "@/lib/calls";
+import { INFRA_SIMULATION_OPENING_LINE } from "@/lib/demoScripts";
 import { getServerEnv } from "@/lib/env";
 import { maskPhoneNumber } from "@/lib/mask";
 import { PERSONA_DEFAULT } from "@/lib/types";
@@ -39,13 +40,17 @@ export async function POST(request: Request) {
     return new NextResponse("Bad Request", { status: 400 });
   }
 
+  // Demo (outbound) calls already have their row created by
+  // /api/demo/start-call, with the correct direction, demo_mode, and masked
+  // demo number — don't let this webhook clobber that. Real inbound calls
+  // hit this route first, so this is where their row gets created (and are
+  // never in a demo mode).
+  let resolvedDemoMode: string | null = null;
   try {
-    // Demo (outbound) calls already have their row created by
-    // /api/demo/start-call, with the correct direction and masked demo
-    // number — don't let this webhook clobber that. Real inbound calls hit
-    // this route first, so this is where their row gets created.
     const existing = await getCallByTwilioSid(callSid);
-    if (!existing) {
+    if (existing) {
+      resolvedDemoMode = existing.demoMode;
+    } else {
       const isInbound = params.Direction === "inbound";
       const counterpartyNumber = isInbound ? params.From : params.To;
       await createCall({
@@ -67,10 +72,16 @@ export async function POST(request: Request) {
   relayUrl.searchParams.set("callSid", callSid);
   relayUrl.searchParams.set("token", token);
 
+  // Infrastructure-simulation calls have ScamSink speak first, via Twilio's
+  // own connect-time TTS — there's no race against the WS relay session
+  // starting up, since this greeting is spoken independently of it.
+  const welcomeGreeting =
+    resolvedDemoMode === "infrastructure_simulation" ? INFRA_SIMULATION_OPENING_LINE : WELCOME_GREETING;
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <ConversationRelay url="${xmlEscape(relayUrl.toString())}" welcomeGreeting="${xmlEscape(WELCOME_GREETING)}" />
+    <ConversationRelay url="${xmlEscape(relayUrl.toString())}" welcomeGreeting="${xmlEscape(welcomeGreeting)}" />
   </Connect>
 </Response>`;
 

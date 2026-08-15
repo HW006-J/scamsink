@@ -1,23 +1,45 @@
 import { query, queryOne } from "./db";
-import type { CallDetail, CallDirection, CallHistoryItem, CallMetrics, CallStatus, DashboardState, Speaker } from "./types";
+import type {
+  CallDetail,
+  CallDirection,
+  CallHistoryItem,
+  CallMetrics,
+  CallStatus,
+  DashboardState,
+  DemoMode,
+  Speaker,
+} from "./types";
 
 export interface CallLookup {
   id: string;
   status: CallStatus;
+  demoMode: DemoMode | null;
+}
+
+interface CallLookupRow {
+  id: string;
+  status: CallStatus;
+  demo_mode: DemoMode | null;
+}
+
+function toCallLookup(row: CallLookupRow): CallLookup {
+  return { id: row.id, status: row.status, demoMode: row.demo_mode };
 }
 
 export async function getCallByTwilioSid(twilioCallSid: string): Promise<CallLookup | null> {
-  return queryOne<CallLookup>(
-    `select id, status from calls where twilio_call_sid = $1`,
+  const row = await queryOne<CallLookupRow>(
+    `select id, status, demo_mode from calls where twilio_call_sid = $1`,
     [twilioCallSid],
   );
+  return row ? toCallLookup(row) : null;
 }
 
 /** Any call not yet completed/failed — used to stop a second demo call from being started concurrently. */
 export async function getActiveCall(): Promise<CallLookup | null> {
-  return queryOne<CallLookup>(
-    `select id, status from calls where status in ('ringing', 'active') order by created_at desc limit 1`,
+  const row = await queryOne<CallLookupRow>(
+    `select id, status, demo_mode from calls where status in ('ringing', 'active') order by created_at desc limit 1`,
   );
+  return row ? toCallLookup(row) : null;
 }
 
 /** Used to enforce a cooldown between demo call creations, regardless of outcome. */
@@ -33,22 +55,30 @@ interface CreateCallInput {
   callerNumberMasked: string | null;
   persona: string;
   direction?: CallDirection;
+  demoMode?: DemoMode;
 }
 
 /**
  * Idempotent: Twilio can retry the voice webhook for the same CallSid, so
  * this upserts rather than erroring on the unique constraint. The update
- * branch intentionally leaves `direction` alone — it's set once at creation
- * (by whichever route sees the CallSid first) and never flips afterward.
+ * branch intentionally leaves `direction`/`demo_mode` alone — they're set
+ * once at creation (by whichever route sees the CallSid first) and never
+ * flip afterward.
  */
 export async function createCall(input: CreateCallInput): Promise<{ id: string }> {
   const row = await queryOne<{ id: string }>(
-    `insert into calls (twilio_call_sid, status, caller_number_masked, persona, direction)
-     values ($1, 'ringing', $2, $3, $4)
+    `insert into calls (twilio_call_sid, status, caller_number_masked, persona, direction, demo_mode)
+     values ($1, 'ringing', $2, $3, $4, $5)
      on conflict (twilio_call_sid)
      do update set caller_number_masked = excluded.caller_number_masked
      returning id`,
-    [input.twilioCallSid, input.callerNumberMasked, input.persona, input.direction ?? "inbound"],
+    [
+      input.twilioCallSid,
+      input.callerNumberMasked,
+      input.persona,
+      input.direction ?? "inbound",
+      input.demoMode ?? null,
+    ],
   );
   if (!row) throw new Error("Failed to create call record");
   return row;
@@ -112,6 +142,7 @@ interface CallRow {
   twilio_call_sid: string;
   status: CallStatus;
   direction: CallDirection;
+  demo_mode: DemoMode | null;
   caller_number_masked: string | null;
   started_at: Date | null;
   ended_at: Date | null;
@@ -135,6 +166,7 @@ function toCallSnapshot(call: CallRow) {
     id: call.id,
     status: call.status,
     direction: call.direction,
+    demoMode: call.demo_mode,
     callerNumberMasked: call.caller_number_masked,
     startedAt: toIso(call.started_at),
     endedAt: toIso(call.ended_at),
@@ -163,22 +195,58 @@ async function fetchTranscript(callId: string): Promise<TranscriptRow[]> {
 }
 
 /**
- * Aggregate stats across every completed call. Only 'completed' calls count
- * — a failed/never-connected call didn't waste any scammer time and would
+ * Aggregate stats across every completed call, excluding infrastructure
+ * simulation calls (those have their own getSimulationMetrics panel, so
+ * they don't count toward "scammer time wasted"). Only 'completed' calls
+ * count — a failed/never-connected call didn't waste any time and would
  * skew the average downward with a near-zero duration.
  */
 export async function getDashboardMetrics(): Promise<CallMetrics> {
   const totals = await queryOne<{ total_calls: number; total_time_wasted_seconds: number }>(
     `select
-       count(*) filter (where status = 'completed')::int as total_calls,
-       coalesce(sum(duration_seconds) filter (where status = 'completed'), 0)::int as total_time_wasted_seconds
+       count(*) filter (where status = 'completed' and demo_mode is distinct from 'infrastructure_simulation')::int as total_calls,
+       coalesce(sum(duration_seconds) filter (where status = 'completed' and demo_mode is distinct from 'infrastructure_simulation'), 0)::int as total_time_wasted_seconds
      from calls`,
   );
   const turnsRow = await queryOne<{ total_turns: number }>(
     `select count(*)::int as total_turns
      from transcript_messages tm
      join calls c on c.id = tm.call_id
-     where c.status = 'completed' and tm.speaker != 'system'`,
+     where c.status = 'completed' and tm.speaker != 'system'
+       and c.demo_mode is distinct from 'infrastructure_simulation'`,
+  );
+
+  const totalCalls = totals?.total_calls ?? 0;
+  const totalTimeWastedSeconds = totals?.total_time_wasted_seconds ?? 0;
+
+  return {
+    totalCalls,
+    totalTimeWastedSeconds,
+    averageCallSeconds: totalCalls > 0 ? Math.round(totalTimeWastedSeconds / totalCalls) : 0,
+    totalTurns: turnsRow?.total_turns ?? 0,
+  };
+}
+
+/**
+ * Same shape as getDashboardMetrics, scoped to only completed
+ * infrastructure-simulation calls — the "SIMULATED ADVERSARY TIME
+ * DIVERTED" panel. Always derived from real completed_calls rows, never
+ * faked; naturally all-zero until a real simulation call completes.
+ */
+export async function getSimulationMetrics(): Promise<CallMetrics> {
+  const totals = await queryOne<{ total_calls: number; total_time_wasted_seconds: number }>(
+    `select
+       count(*) filter (where status = 'completed')::int as total_calls,
+       coalesce(sum(duration_seconds) filter (where status = 'completed'), 0)::int as total_time_wasted_seconds
+     from calls
+     where demo_mode = 'infrastructure_simulation'`,
+  );
+  const turnsRow = await queryOne<{ total_turns: number }>(
+    `select count(*)::int as total_turns
+     from transcript_messages tm
+     join calls c on c.id = tm.call_id
+     where c.status = 'completed' and tm.speaker != 'system'
+       and c.demo_mode = 'infrastructure_simulation'`,
   );
 
   const totalCalls = totals?.total_calls ?? 0;
@@ -201,7 +269,7 @@ interface HistoryRow extends CallRow {
 export async function getRecentCalls(limit = 10): Promise<CallHistoryItem[]> {
   const rows = await query<HistoryRow>(
     `select
-       c.id, c.twilio_call_sid, c.status, c.direction, c.caller_number_masked,
+       c.id, c.twilio_call_sid, c.status, c.direction, c.demo_mode, c.caller_number_masked,
        c.started_at, c.ended_at, c.duration_seconds, c.persona, c.created_at,
        count(tm.id) filter (where tm.speaker != 'system')::int as turns
      from calls c
@@ -222,7 +290,7 @@ export async function getRecentCalls(limit = 10): Promise<CallHistoryItem[]> {
 /** Single call plus its full transcript — used for the "expand a history row" view. */
 export async function getCallById(id: string): Promise<CallDetail | null> {
   const call = await queryOne<CallRow>(
-    `select id, twilio_call_sid, status, direction, caller_number_masked, started_at, ended_at, duration_seconds, persona
+    `select id, twilio_call_sid, status, direction, demo_mode, caller_number_masked, started_at, ended_at, duration_seconds, persona
      from calls
      where id = $1`,
     [id],
@@ -241,16 +309,20 @@ export async function getCallById(id: string): Promise<CallDetail | null> {
  */
 export async function getDashboardState(): Promise<DashboardState> {
   const call = await queryOne<CallRow>(
-    `select id, twilio_call_sid, status, direction, caller_number_masked, started_at, ended_at, duration_seconds, persona
+    `select id, twilio_call_sid, status, direction, demo_mode, caller_number_masked, started_at, ended_at, duration_seconds, persona
      from calls
      order by created_at desc
      limit 1`
   );
 
-  const [metrics, recentCalls] = await Promise.all([getDashboardMetrics(), getRecentCalls()]);
+  const [metrics, simulationMetrics, recentCalls] = await Promise.all([
+    getDashboardMetrics(),
+    getSimulationMetrics(),
+    getRecentCalls(),
+  ]);
 
   if (!call) {
-    return { call: null, transcript: [], metrics, recentCalls, serverTimeMs: Date.now() };
+    return { call: null, transcript: [], metrics, simulationMetrics, recentCalls, serverTimeMs: Date.now() };
   }
 
   const transcriptRows = await fetchTranscript(call.id);
@@ -259,6 +331,7 @@ export async function getDashboardState(): Promise<DashboardState> {
     call: toCallSnapshot(call),
     transcript: toTranscript(transcriptRows),
     metrics,
+    simulationMetrics,
     recentCalls,
     serverTimeMs: Date.now(),
   };
