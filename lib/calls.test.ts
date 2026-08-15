@@ -12,6 +12,7 @@ import {
   getDashboardMetrics,
   getMostRecentDemoCallCreatedAt,
   getRecentCalls,
+  getScamHoneypotMetrics,
   getSimulationMetrics,
 } from "./calls";
 
@@ -104,6 +105,49 @@ describe("getSimulationMetrics", () => {
     const metrics = await getSimulationMetrics();
 
     expect(metrics).toEqual({ totalCalls: 0, totalTimeWastedSeconds: 0, averageCallSeconds: 0, totalTurns: 0 });
+  });
+});
+
+describe("getScamHoneypotMetrics", () => {
+  beforeEach(() => {
+    queryOneMock.mockReset();
+  });
+
+  it("computes totals scoped to scam_honeypot calls only", async () => {
+    queryOneMock
+      .mockResolvedValueOnce({ total_calls: 2, total_time_wasted_seconds: 159 })
+      .mockResolvedValueOnce({ total_turns: 15 });
+
+    const metrics = await getScamHoneypotMetrics();
+
+    expect(metrics).toEqual({
+      totalCalls: 2,
+      totalTimeWastedSeconds: 159,
+      averageCallSeconds: 80,
+      totalTurns: 15,
+    });
+    expect(queryOneMock).toHaveBeenNthCalledWith(1, expect.stringContaining("demo_mode = 'scam_honeypot'"));
+  });
+
+  it("returns all-zero metrics when there are no scam_honeypot calls yet (never fakes numbers)", async () => {
+    queryOneMock
+      .mockResolvedValueOnce({ total_calls: 0, total_time_wasted_seconds: 0 })
+      .mockResolvedValueOnce({ total_turns: 0 });
+
+    const metrics = await getScamHoneypotMetrics();
+
+    expect(metrics).toEqual({ totalCalls: 0, totalTimeWastedSeconds: 0, averageCallSeconds: 0, totalTurns: 0 });
+  });
+
+  it("excludes real inbound calls (only demo_mode='scam_honeypot', not null)", async () => {
+    queryOneMock
+      .mockResolvedValueOnce({ total_calls: 1, total_time_wasted_seconds: 30 })
+      .mockResolvedValueOnce({ total_turns: 4 });
+
+    await getScamHoneypotMetrics();
+
+    const firstCallSql = queryOneMock.mock.calls[0][0] as string;
+    expect(firstCallSql).not.toContain("is distinct from");
   });
 });
 

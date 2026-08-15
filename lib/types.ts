@@ -92,6 +92,10 @@ export const dashboardStateSchema = z.object({
   // Same shape as `metrics`, scoped to demo_mode='infrastructure_simulation'
   // completed calls only — the "SIMULATED ADVERSARY TIME DIVERTED" panel.
   simulationMetrics: callMetricsSchema,
+  // Same shape, scoped to demo_mode='scam_honeypot' completed calls only —
+  // the compact breakdown card paired with simulationMetrics. `metrics`
+  // above remains the true grand total (including any real inbound calls).
+  scamHoneypotMetrics: callMetricsSchema,
   recentCalls: z.array(callHistoryItemSchema),
   serverTimeMs: z.number(),
 });

@@ -260,6 +260,39 @@ export async function getSimulationMetrics(): Promise<CallMetrics> {
   };
 }
 
+/**
+ * Same shape as getDashboardMetrics/getSimulationMetrics, scoped to only
+ * completed scam_honeypot demo calls (excludes real inbound calls, which
+ * still count toward the overall getDashboardMetrics total but aren't
+ * attributed to this specific breakdown card).
+ */
+export async function getScamHoneypotMetrics(): Promise<CallMetrics> {
+  const totals = await queryOne<{ total_calls: number; total_time_wasted_seconds: number }>(
+    `select
+       count(*) filter (where status = 'completed')::int as total_calls,
+       coalesce(sum(duration_seconds) filter (where status = 'completed'), 0)::int as total_time_wasted_seconds
+     from calls
+     where demo_mode = 'scam_honeypot'`,
+  );
+  const turnsRow = await queryOne<{ total_turns: number }>(
+    `select count(*)::int as total_turns
+     from transcript_messages tm
+     join calls c on c.id = tm.call_id
+     where c.status = 'completed' and tm.speaker != 'system'
+       and c.demo_mode = 'scam_honeypot'`,
+  );
+
+  const totalCalls = totals?.total_calls ?? 0;
+  const totalTimeWastedSeconds = totals?.total_time_wasted_seconds ?? 0;
+
+  return {
+    totalCalls,
+    totalTimeWastedSeconds,
+    averageCallSeconds: totalCalls > 0 ? Math.round(totalTimeWastedSeconds / totalCalls) : 0,
+    totalTurns: turnsRow?.total_turns ?? 0,
+  };
+}
+
 interface HistoryRow extends CallRow {
   created_at: Date;
   turns: number;
@@ -315,14 +348,23 @@ export async function getDashboardState(): Promise<DashboardState> {
      limit 1`
   );
 
-  const [metrics, simulationMetrics, recentCalls] = await Promise.all([
+  const [metrics, simulationMetrics, scamHoneypotMetrics, recentCalls] = await Promise.all([
     getDashboardMetrics(),
     getSimulationMetrics(),
+    getScamHoneypotMetrics(),
     getRecentCalls(),
   ]);
 
   if (!call) {
-    return { call: null, transcript: [], metrics, simulationMetrics, recentCalls, serverTimeMs: Date.now() };
+    return {
+      call: null,
+      transcript: [],
+      metrics,
+      simulationMetrics,
+      scamHoneypotMetrics,
+      recentCalls,
+      serverTimeMs: Date.now(),
+    };
   }
 
   const transcriptRows = await fetchTranscript(call.id);
@@ -332,6 +374,7 @@ export async function getDashboardState(): Promise<DashboardState> {
     transcript: toTranscript(transcriptRows),
     metrics,
     simulationMetrics,
+    scamHoneypotMetrics,
     recentCalls,
     serverTimeMs: Date.now(),
   };
