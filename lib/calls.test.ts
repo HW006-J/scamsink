@@ -7,21 +7,14 @@ const { queryMock, queryOneMock } = vi.hoisted(() => ({
 
 vi.mock("./db", () => ({ query: queryMock, queryOne: queryOneMock }));
 
-import {
-  getCallById,
-  getDashboardMetrics,
-  getMostRecentDemoCallCreatedAt,
-  getRecentCalls,
-  getScamHoneypotMetrics,
-  getSimulationMetrics,
-} from "./calls";
+import { getCallById, getDashboardMetrics, getMostRecentDemoCallCreatedAt, getRecentCalls } from "./calls";
 
 describe("getDashboardMetrics", () => {
   beforeEach(() => {
     queryOneMock.mockReset();
   });
 
-  it("computes totals, average, and turns from completed calls only", async () => {
+  it("computes totals, average, and turns from completed infrastructure-simulation calls", async () => {
     queryOneMock
       .mockResolvedValueOnce({ total_calls: 6, total_time_wasted_seconds: 276 })
       .mockResolvedValueOnce({ total_turns: 31 });
@@ -36,18 +29,18 @@ describe("getDashboardMetrics", () => {
     });
   });
 
-  it("excludes infrastructure_simulation calls from the query", async () => {
+  it("scopes the query to demo_mode='infrastructure_simulation' only, excluding legacy scam-demo rows", async () => {
     queryOneMock
       .mockResolvedValueOnce({ total_calls: 0, total_time_wasted_seconds: 0 })
       .mockResolvedValueOnce({ total_turns: 0 });
 
     await getDashboardMetrics();
 
-    expect(queryOneMock).toHaveBeenNthCalledWith(1, expect.stringContaining("infrastructure_simulation"));
-    expect(queryOneMock).toHaveBeenNthCalledWith(2, expect.stringContaining("infrastructure_simulation"));
+    expect(queryOneMock).toHaveBeenNthCalledWith(1, expect.stringContaining("demo_mode = 'infrastructure_simulation'"));
+    expect(queryOneMock).toHaveBeenNthCalledWith(2, expect.stringContaining("demo_mode = 'infrastructure_simulation'"));
   });
 
-  it("returns all-zero metrics when there are no completed calls", async () => {
+  it("returns all-zero metrics when there are no completed simulation calls yet (never fakes numbers)", async () => {
     queryOneMock
       .mockResolvedValueOnce({ total_calls: 0, total_time_wasted_seconds: 0 })
       .mockResolvedValueOnce({ total_turns: 0 });
@@ -76,87 +69,12 @@ describe("getDashboardMetrics", () => {
   });
 });
 
-describe("getSimulationMetrics", () => {
-  beforeEach(() => {
-    queryOneMock.mockReset();
-  });
-
-  it("computes totals scoped to infrastructure_simulation calls only", async () => {
-    queryOneMock
-      .mockResolvedValueOnce({ total_calls: 2, total_time_wasted_seconds: 202 })
-      .mockResolvedValueOnce({ total_turns: 10 });
-
-    const metrics = await getSimulationMetrics();
-
-    expect(metrics).toEqual({
-      totalCalls: 2,
-      totalTimeWastedSeconds: 202,
-      averageCallSeconds: 101,
-      totalTurns: 10,
-    });
-    expect(queryOneMock).toHaveBeenNthCalledWith(1, expect.stringContaining("demo_mode = 'infrastructure_simulation'"));
-  });
-
-  it("returns all-zero metrics when there are no simulation calls yet (never fakes numbers)", async () => {
-    queryOneMock
-      .mockResolvedValueOnce({ total_calls: 0, total_time_wasted_seconds: 0 })
-      .mockResolvedValueOnce({ total_turns: 0 });
-
-    const metrics = await getSimulationMetrics();
-
-    expect(metrics).toEqual({ totalCalls: 0, totalTimeWastedSeconds: 0, averageCallSeconds: 0, totalTurns: 0 });
-  });
-});
-
-describe("getScamHoneypotMetrics", () => {
-  beforeEach(() => {
-    queryOneMock.mockReset();
-  });
-
-  it("computes totals scoped to scam_honeypot calls only", async () => {
-    queryOneMock
-      .mockResolvedValueOnce({ total_calls: 2, total_time_wasted_seconds: 159 })
-      .mockResolvedValueOnce({ total_turns: 15 });
-
-    const metrics = await getScamHoneypotMetrics();
-
-    expect(metrics).toEqual({
-      totalCalls: 2,
-      totalTimeWastedSeconds: 159,
-      averageCallSeconds: 80,
-      totalTurns: 15,
-    });
-    expect(queryOneMock).toHaveBeenNthCalledWith(1, expect.stringContaining("demo_mode = 'scam_honeypot'"));
-  });
-
-  it("returns all-zero metrics when there are no scam_honeypot calls yet (never fakes numbers)", async () => {
-    queryOneMock
-      .mockResolvedValueOnce({ total_calls: 0, total_time_wasted_seconds: 0 })
-      .mockResolvedValueOnce({ total_turns: 0 });
-
-    const metrics = await getScamHoneypotMetrics();
-
-    expect(metrics).toEqual({ totalCalls: 0, totalTimeWastedSeconds: 0, averageCallSeconds: 0, totalTurns: 0 });
-  });
-
-  it("excludes real inbound calls (only demo_mode='scam_honeypot', not null)", async () => {
-    queryOneMock
-      .mockResolvedValueOnce({ total_calls: 1, total_time_wasted_seconds: 30 })
-      .mockResolvedValueOnce({ total_turns: 4 });
-
-    await getScamHoneypotMetrics();
-
-    const firstCallSql = queryOneMock.mock.calls[0][0] as string;
-    expect(firstCallSql).not.toContain("is distinct from");
-  });
-});
-
 describe("getRecentCalls", () => {
   beforeEach(() => {
     queryMock.mockReset();
   });
 
-  it("maps rows to history items with turn counts", async () => {
+  it("maps rows to history items with turn counts (also verifies legacy demo_mode values still flow through unchanged, since historical rows are never deleted)", async () => {
     queryMock.mockResolvedValueOnce([
       {
         id: "call-1",
@@ -214,7 +132,7 @@ describe("getCallById", () => {
     expect(queryMock).not.toHaveBeenCalled();
   });
 
-  it("returns the call snapshot with its transcript", async () => {
+  it("returns the call snapshot with its transcript (legacy scam_honeypot rows are never deleted and still return correctly)", async () => {
     queryOneMock.mockResolvedValueOnce({
       id: "call-1",
       twilio_call_sid: "CA1",

@@ -34,7 +34,7 @@ export default async function DemoPage() {
       <div>
         <h1 className="text-3xl font-semibold tracking-tight">Demo setup</h1>
         <p className="mt-2 text-sm text-muted">
-          Everything you need to run the ScamSink demo end to end.
+          Everything you need to run the ScamSink infrastructure-simulation demo end to end.
         </p>
       </div>
 
@@ -61,13 +61,17 @@ export default async function DemoPage() {
       <section>
         <h2 className="text-xs uppercase tracking-[0.2em] text-muted">Demo instructions</h2>
         <ol className="mt-3 space-y-2 text-sm text-foreground">
-          <li>1. Call the ScamSink number above.</li>
-          <li>2. Speak as a scam caller (e.g. &ldquo;we&rsquo;re calling about suspicious activity on your account&rdquo;).</li>
-          <li>3. Watch ScamSink answer, confused and polite, on the dashboard.</li>
-          <li>4. Watch the transcript update live as the call continues.</li>
+          <li>1. Open the dashboard and enter an allowlisted phone number.</li>
+          <li>2. Click &ldquo;Start call&rdquo; and enter the operator passphrase if prompted.</li>
+          <li>3. Answer the call — ScamSink speaks first with the infrastructure-simulation opening line.</li>
+          <li>4. Play along as the person receiving the call; watch the transcript update live on the dashboard.</li>
           <li>5. Hang up.</li>
-          <li>6. See total time wasted on the dashboard.</li>
+          <li>6. See total time diverted on the dashboard.</li>
         </ol>
+        <p className="mt-3 text-xs text-muted">
+          This is a defensive simulation using consenting, allowlisted test numbers only — it never contacts a
+          real adversary.
+        </p>
       </section>
 
       <Link href="/" className="text-sm text-accent-green underline underline-offset-4">

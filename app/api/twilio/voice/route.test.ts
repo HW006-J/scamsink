@@ -1,22 +1,19 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
-const { createCallMock, getCallByTwilioSidMock, readVerifiedTwilioRequestMock, InvalidTwilioSignatureError } =
-  vi.hoisted(() => {
-    class InvalidTwilioSignatureError extends Error {}
-    return {
-      createCallMock: vi.fn(),
-      getCallByTwilioSidMock: vi.fn(),
-      readVerifiedTwilioRequestMock: vi.fn(),
-      InvalidTwilioSignatureError,
-    };
-  });
+const { getCallByTwilioSidMock, readVerifiedTwilioRequestMock, InvalidTwilioSignatureError } = vi.hoisted(() => {
+  class InvalidTwilioSignatureError extends Error {}
+  return {
+    getCallByTwilioSidMock: vi.fn(),
+    readVerifiedTwilioRequestMock: vi.fn(),
+    InvalidTwilioSignatureError,
+  };
+});
 
 vi.mock("@/lib/twilioAuth", () => ({
   InvalidTwilioSignatureError,
   readVerifiedTwilioRequest: readVerifiedTwilioRequestMock,
 }));
 vi.mock("@/lib/calls", () => ({
-  createCall: createCallMock,
   getCallByTwilioSid: getCallByTwilioSidMock,
 }));
 vi.mock("@/lib/env", () => ({
@@ -38,7 +35,6 @@ function makeRequest(body: string): Request {
 
 describe("POST /api/twilio/voice", () => {
   beforeEach(() => {
-    createCallMock.mockReset().mockResolvedValue({ id: "call-id-1" });
     getCallByTwilioSidMock.mockReset().mockResolvedValue(null);
     readVerifiedTwilioRequestMock.mockReset();
   });
@@ -49,7 +45,6 @@ describe("POST /api/twilio/voice", () => {
     const res = await POST(makeRequest("CallSid=CAxxxx&From=%2B15551234567"));
 
     expect(res.status).toBe(403);
-    expect(createCallMock).not.toHaveBeenCalled();
   });
 
   it("rejects a malformed webhook missing CallSid", async () => {
@@ -58,142 +53,91 @@ describe("POST /api/twilio/voice", () => {
     const res = await POST(makeRequest("From=%2B15551234567"));
 
     expect(res.status).toBe(400);
-    expect(createCallMock).not.toHaveBeenCalled();
   });
 
-  it("creates a call and returns ConversationRelay TwiML for a valid request", async () => {
-    readVerifiedTwilioRequestMock.mockResolvedValue({
-      CallSid: "CAxxxx",
-      From: "+15551234567",
+  // The scam-honeypot mode and the real inbound engagement flow have both
+  // been removed. Any call whose row wasn't pre-created by
+  // /api/demo/start-call — most notably a genuine new inbound call to the
+  // Twilio number — now gets a safe, non-interactive hangup instead of ever
+  // touching ConversationRelay, the voice server, or the database.
+  describe("unrecognized call (no pre-created row) — safe hangup path", () => {
+    it("returns a Say+Hangup response, never ConversationRelay, for a genuine new inbound call", async () => {
+      getCallByTwilioSidMock.mockResolvedValue(null);
+      readVerifiedTwilioRequestMock.mockResolvedValue({
+        CallSid: "CAinbound",
+        From: "+15551234567",
+        To: "+12184293208",
+        Direction: "inbound",
+      });
+
+      const res = await POST(makeRequest("CallSid=CAinbound"));
+      const xml = await res.text();
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/xml");
+      expect(xml).toContain("<Say>");
+      expect(xml).toContain("<Hangup");
+      expect(xml).not.toContain("ConversationRelay");
+      expect(xml).not.toContain("Hi, I need some parts urgently");
     });
-    createCallMock.mockResolvedValue({ id: "call-id-1" });
 
-    const res = await POST(makeRequest("CallSid=CAxxxx&From=%2B15551234567"));
-    const xml = await res.text();
+    it("never creates a database row for an unrecognized call", async () => {
+      getCallByTwilioSidMock.mockResolvedValue(null);
+      readVerifiedTwilioRequestMock.mockResolvedValue({ CallSid: "CAinbound", From: "+15551234567" });
 
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toContain("text/xml");
-    expect(xml).toContain("<ConversationRelay");
-    expect(xml).toContain("wss://voice.example.com/relay");
-    expect(createCallMock).toHaveBeenCalledWith(
-      expect.objectContaining({ twilioCallSid: "CAxxxx" }),
-    );
+      await POST(makeRequest("CallSid=CAinbound"));
+
+      // No createCall import exists in this route at all any more — if the
+      // route tried to call it, this mock module would throw on import.
+      expect(getCallByTwilioSidMock).toHaveBeenCalledWith("CAinbound");
+    });
+
+    it("returns the same safe hangup even if the database lookup itself fails", async () => {
+      getCallByTwilioSidMock.mockRejectedValue(new Error("connection refused"));
+      readVerifiedTwilioRequestMock.mockResolvedValue({ CallSid: "CAxxxx", From: "+15551234567" });
+
+      const res = await POST(makeRequest("CallSid=CAxxxx"));
+      const xml = await res.text();
+
+      expect(res.status).toBe(200);
+      expect(xml).toContain("<Hangup");
+      expect(xml).not.toContain("ConversationRelay");
+    });
   });
 
-  it("fails the call cleanly (TwiML, not a 500) if the database write fails", async () => {
-    readVerifiedTwilioRequestMock.mockResolvedValue({
-      CallSid: "CAxxxx",
-      From: "+15551234567",
-    });
-    createCallMock.mockRejectedValue(new Error("database unavailable"));
+  describe("recognized outbound demo call (row pre-created by /api/demo/start-call)", () => {
+    it("connects to ConversationRelay with the infrastructure-simulation opening line as welcomeGreeting", async () => {
+      getCallByTwilioSidMock.mockResolvedValue({ id: "existing-call-id", status: "ringing" });
+      readVerifiedTwilioRequestMock.mockResolvedValue({
+        CallSid: "CAinfra",
+        From: "+12184293208",
+        To: "+447700900000",
+        Direction: "outbound-api",
+      });
 
-    const res = await POST(makeRequest("CallSid=CAxxxx&From=%2B15551234567"));
-    const xml = await res.text();
+      const res = await POST(makeRequest("CallSid=CAinfra"));
+      const xml = await res.text();
 
-    expect(res.status).toBe(200);
-    expect(xml).toContain("<Hangup");
-    expect(xml).not.toContain("ConversationRelay");
-  });
-
-  it("infers direction=inbound and masks From for a genuine inbound call", async () => {
-    readVerifiedTwilioRequestMock.mockResolvedValue({
-      CallSid: "CAxxxx",
-      From: "+15551234567",
-      To: "+12184293208",
-      Direction: "inbound",
+      expect(res.status).toBe(200);
+      expect(xml).toContain("<ConversationRelay");
+      expect(xml).toContain("wss://voice.example.com/relay");
+      expect(xml).toContain("welcomeGreeting=");
+      expect(xml).toContain("Hi, I need some parts urgently to repair five drones");
     });
 
-    await POST(makeRequest("CallSid=CAxxxx"));
+    it("does not create a new row — the pre-created one from /api/demo/start-call is used as-is", async () => {
+      getCallByTwilioSidMock.mockResolvedValue({ id: "existing-call-id", status: "ringing" });
+      readVerifiedTwilioRequestMock.mockResolvedValue({
+        CallSid: "CAoutbound",
+        From: "+12184293208",
+        To: "+447700900000",
+        Direction: "outbound-api",
+      });
 
-    expect(createCallMock).toHaveBeenCalledWith(
-      expect.objectContaining({ direction: "inbound" }),
-    );
-  });
+      const res = await POST(makeRequest("CallSid=CAoutbound"));
 
-  it("infers direction=outbound_demo and uses To (the callee) when Direction is not inbound", async () => {
-    readVerifiedTwilioRequestMock.mockResolvedValue({
-      CallSid: "CAoutbound",
-      From: "+12184293208",
-      To: "+447700900000",
-      Direction: "outbound-api",
+      expect(res.status).toBe(200);
+      expect(getCallByTwilioSidMock).toHaveBeenCalledWith("CAoutbound");
     });
-
-    await POST(makeRequest("CallSid=CAoutbound"));
-
-    expect(createCallMock).toHaveBeenCalledWith(
-      expect.objectContaining({ direction: "outbound_demo" }),
-    );
-  });
-
-  it("does not re-create (and cannot clobber) a call row already created by /api/demo/start-call", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({ id: "existing-call-id", status: "ringing", demoMode: null });
-    readVerifiedTwilioRequestMock.mockResolvedValue({
-      CallSid: "CAoutbound",
-      From: "+12184293208",
-      To: "+447700900000",
-      Direction: "outbound-api",
-    });
-
-    const res = await POST(makeRequest("CallSid=CAoutbound"));
-    const xml = await res.text();
-
-    expect(res.status).toBe(200);
-    expect(xml).toContain("<ConversationRelay");
-    expect(createCallMock).not.toHaveBeenCalled();
-  });
-
-  it("uses the infrastructure-simulation opening line as welcomeGreeting when demo_mode is infrastructure_simulation", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({
-      id: "existing-call-id",
-      status: "ringing",
-      demoMode: "infrastructure_simulation",
-    });
-    readVerifiedTwilioRequestMock.mockResolvedValue({
-      CallSid: "CAinfra",
-      From: "+12184293208",
-      To: "+447700900000",
-      Direction: "outbound-api",
-    });
-
-    const res = await POST(makeRequest("CallSid=CAinfra"));
-    const xml = await res.text();
-
-    expect(xml).toContain("welcomeGreeting=");
-    expect(xml).toContain("Hi, I need some parts urgently to repair five drones");
-    expect(xml).not.toContain("Hello? Sorry, who&apos;s calling?");
-  });
-
-  it("uses the default greeting (bot does NOT speak first) for scam_honeypot calls", async () => {
-    getCallByTwilioSidMock.mockResolvedValue({
-      id: "existing-call-id",
-      status: "ringing",
-      demoMode: "scam_honeypot",
-    });
-    readVerifiedTwilioRequestMock.mockResolvedValue({
-      CallSid: "CAhoneypot",
-      From: "+12184293208",
-      To: "+447700900000",
-      Direction: "outbound-api",
-    });
-
-    const res = await POST(makeRequest("CallSid=CAhoneypot"));
-    const xml = await res.text();
-
-    expect(xml).not.toContain("Hi, I need some parts urgently");
-    expect(xml).toContain("who");
-  });
-
-  it("uses the default greeting for a genuine new inbound call (never a demo mode)", async () => {
-    readVerifiedTwilioRequestMock.mockResolvedValue({
-      CallSid: "CAinbound",
-      From: "+15551234567",
-      To: "+12184293208",
-      Direction: "inbound",
-    });
-
-    const res = await POST(makeRequest("CallSid=CAinbound"));
-    const xml = await res.text();
-
-    expect(xml).not.toContain("Hi, I need some parts urgently");
   });
 });

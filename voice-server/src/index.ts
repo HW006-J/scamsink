@@ -1,6 +1,5 @@
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
-import { createAIProvider } from "./ai/index.js";
 import { verifyRelayToken } from "./auth.js";
 import { initPool } from "./db.js";
 import { loadEnv } from "./env.js";
@@ -8,7 +7,6 @@ import { RelaySession } from "./relay-session.js";
 
 const env = loadEnv();
 initPool(env);
-const aiProvider = createAIProvider(env);
 
 const server = createServer((req, res) => {
   if (req.method === "GET" && (req.url === "/healthz" || req.url === "/")) {
@@ -44,7 +42,7 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 wss.on("connection", (ws) => {
-  new RelaySession(ws, aiProvider);
+  new RelaySession(ws);
 });
 
 server.listen(env.PORT, () => {

@@ -1,16 +1,16 @@
 # ScamSink
 
-**Every minute a scammer spends talking to ScamSink is a minute they're not talking to a real victim.**
+**A defensive simulation: ScamSink calls an allowlisted test number and runs a deterministic, harmless "wasted time" script — a demonstration of diverting a hostile caller's attention, without ever contacting a real adversary.**
 
-ScamSink is a phone number that answers scam calls with an AI persona designed to do exactly one thing: waste the caller's time, harmlessly, for as long as possible. A live dashboard shows the call as it happens — transcript, timer, and total time wasted.
+ScamSink is a phone-number-driven operator console. An operator enters a phone number already on a server-side allowlist, presses **Start call**, and Twilio calls that number using the ScamSink caller ID. Once answered, ScamSink speaks first and runs the **CRITICAL INFRASTRUCTURE SIMULATION** script — a small, fully deterministic state machine, not an LLM — that keeps the conversation going indefinitely, adapts to whatever the other person says, and proactively continues the story even through silence. A live dashboard shows the call as it happens — transcript, timer, and cumulative time diverted.
 
-> ScamSink turns scam calls into dead ends.
+> This is a simulation. It never dials a number that isn't explicitly allowlisted, and it never claims to have engaged a real adversary or real infrastructure personnel.
 
 ---
 
 ## Table of contents
 
-1. [Problem statement](#problem-statement)
+1. [What this is](#what-this-is)
 2. [How it works](#how-it-works)
 3. [Architecture](#architecture)
 4. [Live demo flow](#live-demo-flow)
@@ -26,36 +26,35 @@ ScamSink is a phone number that answers scam calls with an AI persona designed t
 14. [Responsible-use boundaries](#responsible-use-boundaries)
 15. [Testing](#testing)
 16. [Known limitations](#known-limitations)
-17. [Future work](#future-work)
 
 ---
 
-## Problem statement
+## What this is
 
-Phone scams work on volume — the more time a scammer spends on live calls, the more victims they eventually reach. Individually hanging up denies a scammer nothing; the next call is seconds away. ScamSink instead **absorbs** the call: it answers, sounds like a real, easily-confused person, and keeps the caller engaged for as long as possible, for free, at scale, without a human on the other end ever being at risk.
+This started as a hackathon exploration of "waste a scam caller's time," including a real inbound-call honeypot powered by an LLM. That inbound flow has been removed. The product now demonstrates a narrower, more controllable idea: **an operator-triggered outbound simulation** that shows how a fully scripted, deterministic voice agent can keep a conversation going indefinitely — adapting to paraphrases, ignoring dead air, and never running out of things to say — without any LLM in the reply-generation path at all.
 
-The only claim ScamSink makes is the one it can prove: total time spent interacting with the honeypot. It does not (and cannot) claim to have "saved" any specific victim.
+Any call this product places goes only to a number the operator has explicitly allowlisted server-side. If someone dials the ScamSink Twilio number directly, they get a short, polite, non-interactive message and a hangup — never a script, never an AI conversation.
 
 ## How it works
 
-1. A scammer calls the ScamSink phone number.
-2. Twilio answers and connects the call to an AI voice persona over a live, bidirectional audio session (Twilio ConversationRelay).
-3. The persona — polite, slow, easily confused, endlessly willing to keep talking — strings the caller along using natural stalling techniques.
-4. It never reveals genuine personal, financial, or authentication information, and never takes any real-world action the caller asks for.
-5. Every turn of the call streams to a live operator dashboard: status, duration, and transcript.
-6. When the caller hangs up, the dashboard shows total time wasted.
+1. An operator opens the dashboard, enters a phone number, and presses **Start call**.
+2. The server validates the operator's passphrase and checks the number against a server-side allowlist — the browser never decides what's dialable.
+3. Twilio places the call. When it's answered, ScamSink speaks first (Twilio's own connect-time TTS, via ConversationRelay's `welcomeGreeting`).
+4. Every reply after that comes from a deterministic state machine (`voice-server/src/infraScript.ts`): it classifies what the other person said into a fixed set of intents, answers specific questions directly, and otherwise carries its own narrative forward — including proactively continuing after a timed silence window, with no network call in that path that could hang or fail.
+5. Every turn streams to the live dashboard: status, timer, and transcript.
+6. When the call ends, the dashboard shows total time diverted for that call, and the cumulative dashboard metrics update.
 
 ## Architecture
 
 ```
                                    ┌─────────────────────┐
-   Scam caller                    │   Next.js (Vercel)   │
+   Operator (dashboard)            │   Next.js (Vercel)   │
        │                          │  ─────────────────   │
-       │ dials                    │  /api/twilio/voice    ◄── Twilio webhook (answers call,
-       ▼                          │  /api/twilio/status    │   returns <Connect><ConversationRelay>)
-┌─────────────┐   webhook (HTTP)  │  /api/dashboard-state  │
-│   Twilio    │──────────────────►│  /                    │  Dashboard (polls every ~1s)
-│  PSTN + CR  │                   │  /demo                │
+       │ "Start call" + number     │  /api/demo/start-call ◄── places the outbound call
+       ▼                          │  /api/twilio/voice     │   (allowlist + operator-secret enforced)
+┌─────────────┐   places call     │  /api/twilio/status    │
+│   Twilio    │──────────────────►│  /api/dashboard-state  │
+│  PSTN + CR  │                   │  /                     │  Dashboard (polls every ~1s)
 └─────────────┘                   └──────────┬────────────┘
        │                                       │ writes/reads
        │ wss:// (ConversationRelay)             ▼
@@ -66,23 +65,26 @@ The only claim ScamSink makes is the one it can prove: total time spent interact
 │ (Railway/Render/Fly) │   writes      │  call_events        │
 │                       │               └───────────────────┘
 │  WS session per call  │
-│  → Groq (LLM)         │
+│  → deterministic      │
+│    state machine       │
+│    (no LLM)             │
 └─────────────────────┘
 ```
 
-- **Next.js app** (this repo's root) handles the Twilio HTTP webhooks, serves the dashboard, and exposes a polling API backed by Postgres. Deploys to Vercel.
-- **voice-server** is a small, always-on Node/TypeScript process that holds the ConversationRelay WebSocket open for the duration of each call, drives the LLM conversation, and writes the transcript straight to Postgres so the dashboard sees it live. Deploys to Railway, Render, or Fly.io — **not** Vercel, since Vercel's serverless functions can't hold a persistent WebSocket open for the length of a phone call.
+- **Next.js app** (this repo's root) serves the dashboard, places outbound calls via the Twilio REST API (operator-authenticated, allowlisted), handles the Twilio HTTP webhooks, and exposes a polling API backed by Postgres. Deploys to Vercel.
+- **voice-server** is a small, always-on Node/TypeScript process that holds the ConversationRelay WebSocket open for the duration of each call and runs the deterministic infrastructure-simulation script, writing the transcript straight to Postgres so the dashboard sees it live. Deploys to Railway, Render, or Fly.io — **not** Vercel, since Vercel's serverless functions can't hold a persistent WebSocket open for the length of a phone call.
 - **Neon Postgres** is the single source of truth both services read/write directly (no ORM), shared between them via `DATABASE_URL`.
+
+There is no LLM anywhere in the live call path. `voice-server` has no AI provider dependency at all.
 
 ## Live demo flow
 
 1. Open the dashboard. It shows **READY**, `00:00`, no active call.
-2. Call the ScamSink number from a phone.
-3. Within a few seconds the dashboard flips to **LIVE**, the timer starts ticking, and the caller's masked number appears.
-4. Speak as a scammer, e.g. *"Hello, we're calling from your bank. There's been suspicious activity on your account."*
-5. ScamSink answers naturally and stalls: *"Oh dear. Which account was that again?"*
-6. The transcript panel updates live, both sides, as the conversation continues.
-7. Hang up. The dashboard shows **CALL COMPLETE** with total time wasted and the full transcript.
+2. Enter an allowlisted phone number and press **Start call**; enter the operator passphrase if prompted.
+3. Answer the call — ScamSink speaks first with the infrastructure-simulation opening line.
+4. Play along as the person receiving the call. Try a vague answer, an unrelated remark, or just staying silent — the state machine keeps the conversation moving regardless.
+5. The transcript panel updates live as the conversation continues.
+6. Hang up. The dashboard shows **CALL COMPLETE** with time diverted for that call, and the cumulative metrics at the top update.
 
 ## Tech stack
 
@@ -91,43 +93,41 @@ The only claim ScamSink makes is the one it can prove: total time spent interact
 - **Neon Postgres**, accessed directly via `pg` (no ORM)
 - **Vitest** for unit tests
 - **Twilio Voice + ConversationRelay** for the phone call and real-time speech/text bridge
-- **Groq** (`openai/gpt-oss-20b`, via the official `openai` SDK pointed at Groq's OpenAI-compatible endpoint) for the conversational persona; **Anthropic (Claude)** remains supported as an optional fallback provider
-
-### Why Groq for the voice loop
-
-The voice server defaults to Groq's `openai/gpt-oss-20b` rather than a larger, slower model. This is a deliberate latency decision: ScamSink's entire value proposition depends on the gap between *"caller finishes speaking"* and *"ScamSink starts speaking back"* staying short enough to feel like a real phone call, and Groq's inference is currently among the fastest available for a model this capable (~1000 tokens/sec). ScamSink also doesn't need deep reasoning — one short, natural reply per caller turn — which plays to Groq's strengths. Its free tier (30 requests/min, 8K tokens/min for this model) comfortably covers a full demo call. The provider is swappable via `AI_PROVIDER=groq|anthropic`; only the selected provider's API key is required.
+- No LLM/AI SDK dependency — the entire spoken side of every call is a deterministic state machine
 
 ## Twilio architecture
 
-Inbound call flow, using the current (2026) Twilio Voice API:
+Using the current (2026) Twilio Voice API:
 
-1. Twilio receives the inbound call and `POST`s to `PUBLIC_APP_URL/api/twilio/voice` (configured on the phone number).
-2. The route validates the request's `X-Twilio-Signature` against the exact webhook URL and the account's auth token (`twilio.validateRequest`), creates a `calls` row (status `ringing`), and returns TwiML:
+**Outbound (the only real call flow):**
+
+1. `/api/demo/start-call` validates the operator passphrase, normalizes and allowlist-checks the destination number server-side, enforces the one-active-call guard and a creation rate limit, then calls `client.calls.create(...)` and pre-creates the `calls` row (status `ringing`, direction `outbound_demo`).
+2. Twilio calls the number and `POST`s to `PUBLIC_APP_URL/api/twilio/voice`. The route validates the request's `X-Twilio-Signature`, finds the pre-created row, and returns TwiML with ScamSink's opening line as the `welcomeGreeting` — so it speaks first, before the WebSocket session even starts:
    ```xml
    <Response>
      <Connect>
-       <ConversationRelay url="wss://voice-server/relay?callSid=...&token=..." welcomeGreeting="Hello? Sorry, who's calling?" />
+       <ConversationRelay url="wss://voice-server/relay?callSid=...&token=..." welcomeGreeting="Hi, I need some parts urgently..." />
      </Connect>
    </Response>
    ```
    The `url` embeds a short-lived, per-call HMAC token (see [Security & privacy](#security--privacy)) — not a static secret — so only a ConversationRelay session Twilio opens in response to *this specific call* can connect.
-3. Twilio opens the WebSocket to `voice-server` and the two speak the [ConversationRelay message protocol](https://www.twilio.com/docs/voice/conversationrelay/websocket-messages) directly — `setup`, `prompt` (caller speech, transcribed), `interrupt`, and `dtmf` inbound; `text` (spoken response, streamed token-by-token) and `end` outbound.
-4. In parallel, Twilio also `POST`s call-lifecycle events to `PUBLIC_APP_URL/api/twilio/status` (`initiated`, `ringing`, `in-progress`, `completed`, `busy`, `failed`, `no-answer`), which is validated the same way and used as a redundant, authoritative source for call status — independent of whether the WebSocket connection itself behaves correctly.
+3. Twilio opens the WebSocket to `voice-server` and the two speak the [ConversationRelay message protocol](https://www.twilio.com/docs/voice/conversationrelay/websocket-messages) directly — `setup`, `prompt` (caller speech, transcribed), `interrupt`, and `dtmf` inbound; `text` (spoken response) and `end` outbound.
+4. In parallel, Twilio `POST`s call-lifecycle events to `PUBLIC_APP_URL/api/twilio/status`, validated the same way, used as an authoritative source for call status.
+
+**Unrecognized inbound (someone dials the number directly):** `/api/twilio/voice` looks up the CallSid; if no row was pre-created by `/api/demo/start-call`, it returns a plain `<Say>...</Say><Hangup/>` response — no ConversationRelay connection, no database row, no script or AI involvement of any kind.
 
 ## Voice server architecture
 
 `voice-server/` is a standalone Node process (own `package.json`, deployed independently):
 
 - `src/index.ts` — HTTP server (health check) + WebSocket upgrade handling. Verifies the per-call relay token before accepting a connection.
-- `src/relay-session.ts` — one instance per phone call. Parses inbound ConversationRelay messages, maintains conversation history, calls the AI provider, streams the reply back token-by-token, and persists the transcript. Only the most recent `MAX_HISTORY_MESSAGES` (20) turns are sent to the provider each request — the full transcript still persists to Postgres regardless.
-- `src/ai/` — provider abstraction (`AIProvider` interface) with `GroqProvider` (production default) and `AnthropicProvider` (optional) implementations, selected via `AI_PROVIDER`. Throws rather than fabricating a response if the provider is unavailable, times out, or is rate-limited.
-- `src/persona.ts` — the system prompt (see below).
+- `src/relay-session.ts` — one instance per phone call. Parses inbound ConversationRelay messages, drives the deterministic infra-simulation script, manages the proactive-silence timer, and persists the transcript.
+- `src/infraScript.ts` — the deterministic state machine: intent classification (keyword-based, not an LLM) plus a proactive narrative that advances on its own through vague/unintelligible/silent turns, while still answering specific questions on demand regardless of story position.
+- `src/ttsTiming.ts` — conservative word-count-based estimate of how long a line takes to speak, used to time the proactive-silence continuation realistically (Twilio's ConversationRelay protocol has no playback-complete event).
 - `src/db.ts` — direct Postgres access (connection pool), independent of the Next.js app's copy.
 - `src/redact.ts` — best-effort redaction of obvious sensitive numeric strings before anything is persisted.
 
-**Low latency, on purpose:** replies are streamed from the LLM and forwarded to Twilio as `text` tokens as they're generated (not buffered until the full reply is ready), so text-to-speech playback can start before the model has finished "thinking." Interruptions from the caller cancel any in-flight reply generation.
-
-**The persona** (`src/persona.ts`) is an ordinary, easily-confused person: it asks for repetition, forgets details, goes on brief tangents, and stalls indefinitely on any request to send money, install software, or read out a code — without ever refusing outright or breaking character. It is hard-coded to never produce a real-looking password, card number, account number, government ID, or seed phrase, and never to claim it isn't an AI unless safety requires ending the call. See the full prompt in `voice-server/src/persona.ts`.
+**No LLM.** Every reply is a hardcoded, reviewed string selected by pure, synchronous logic — there is no network call in the reply path that can hang, rate-limit, or fail.
 
 ## Neon setup
 
@@ -139,25 +139,25 @@ Inbound call flow, using the current (2026) Twilio Voice API:
    ```
    This applies every `.sql` file in `neon/migrations/` in order, tracked in a `schema_migrations` table, safe to re-run.
 
-Schema (see `neon/migrations/0001_init.sql`):
+Schema (see `neon/migrations/`):
 
 | Table | Purpose |
 |---|---|
-| `calls` | One row per phone call: Twilio CallSid, status, masked caller number, timing, persona. |
+| `calls` | One row per phone call: Twilio CallSid, status, direction, demo mode, masked number, timing, persona. |
 | `transcript_messages` | Turn-by-turn transcript (`caller` / `scamsink` / `system`), ordered by `created_at`. |
-| `call_events` | Lifecycle/diagnostic events (status callbacks, connect/disconnect, provider errors) for debugging. |
+| `call_events` | Lifecycle/diagnostic events (status callbacks, connect/disconnect, script state transitions) for debugging. |
 
-The schema supports listing historical calls later, but the MVP dashboard only ever shows the most recent call.
+Historical rows from an earlier, now-removed demo mode may still exist in the database — they're never deleted, and dashboard metrics are explicitly scoped to exclude them rather than misrepresent them.
 
 ## Environment variables
 
 See `.env.example` (Next.js app) and `voice-server/.env.example` (voice server) for the full annotated list. Summary:
 
 **Next.js app** (Vercel):
-`DATABASE_URL`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `PUBLIC_APP_URL`, `VOICE_SERVER_URL`, `VOICE_SERVER_SHARED_SECRET`
+`DATABASE_URL`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `PUBLIC_APP_URL`, `VOICE_SERVER_URL`, `VOICE_SERVER_SHARED_SECRET`, and optionally `DEMO_PHONE_NUMBER` / `DEMO_OPERATOR_SECRET` / `DEMO_ALLOWED_PHONE_NUMBERS` to enable the dashboard's call console.
 
 **voice-server** (Railway/Render/Fly):
-`DATABASE_URL`, `TWILIO_AUTH_TOKEN`, `PUBLIC_APP_URL`, `VOICE_SERVER_SHARED_SECRET`, `AI_PROVIDER` (`groq` by default), `GROQ_API_KEY`, `GROQ_MODEL`, `PORT` — plus `ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` only if `AI_PROVIDER=anthropic`
+`DATABASE_URL`, `TWILIO_AUTH_TOKEN`, `PUBLIC_APP_URL`, `VOICE_SERVER_SHARED_SECRET`, `PORT` — no AI-provider configuration needed.
 
 `VOICE_SERVER_SHARED_SECRET` must be identical on both sides — generate one with `openssl rand -hex 32`.
 
@@ -179,7 +179,7 @@ cp .env.example .env         # fill in values
 npm run dev                  # ws://localhost:8080/relay
 ```
 
-To actually receive a call locally you'll need a tunnel (e.g. `ngrok`) exposing both the Next.js app and voice-server, with `PUBLIC_APP_URL` / `VOICE_SERVER_URL` pointed at the tunnel URLs and the Twilio number's webhook pointed at the Next.js tunnel URL.
+To actually place a call locally you'll need a tunnel (e.g. `ngrok`) exposing both the Next.js app and voice-server, with `PUBLIC_APP_URL` / `VOICE_SERVER_URL` pointed at the tunnel URLs and the Twilio number's webhook pointed at the Next.js tunnel URL.
 
 ## Deployment
 
@@ -199,24 +199,25 @@ This project deliberately avoids Docker — none of the three services need it f
 
 ## Security & privacy
 
-- **Caller numbers are masked** before they ever reach the dashboard (`lib/mask.ts`) — the full number is used only transiently to build the masked form and is not otherwise displayed. Prefer storing the minimum needed; the schema stores only the masked form.
+- **Every outbound call is authenticated and allowlisted**: `/api/demo/start-call` requires the operator passphrase (`lib/demoAuth.ts`, constant-time compare) and only ever dials a number already on a server-side allowlist — the browser sends a destination as a string, but never decides what's actually dialable. Rate-limited, and only one call may be active at a time.
+- **Caller numbers are masked** before they ever reach the dashboard (`lib/mask.ts`) — the full number is used only transiently to place the call and build the masked form. The schema stores only the masked form.
 - **Twilio webhook signatures are verified** on every request to `/api/twilio/*` (`lib/twilioAuth.ts`), computed against the exact public URL, not whatever `Host` header a request happens to carry.
 - **The ConversationRelay WebSocket is authenticated**: the Next.js voice webhook mints a short-lived, per-CallSid HMAC token (`lib/relayAuth.ts`); voice-server verifies it with a constant-time comparison before accepting the connection (`voice-server/src/auth.ts`). Twilio's own request signing doesn't cover WebSocket upgrades, so this closes that gap.
-- **Basic transcript redaction** (`redact.ts`, both services) strips obvious long digit runs (card numbers, OTP-style codes) before persisting transcript content. **This is a hackathon-grade safety net, not a production-grade sensitive-data redaction system** — it will miss anything that isn't a long digit run, and should not be relied on as the sole safeguard for genuinely sensitive data.
+- **An unrecognized call is never engaged**: someone dialing the Twilio number directly (no pre-created row) gets a plain, non-interactive hangup — never the script, never a database write.
+- **Basic transcript redaction** (`redact.ts`, both services) strips obvious long digit runs before persisting transcript content. **This is a hackathon-grade safety net, not a production-grade sensitive-data redaction system.**
 - Database credentials are never exposed to the browser — all Postgres access happens in server-only route handlers and the voice-server process.
-- The persona is hard-constrained (see above) to never produce genuine-looking credentials and never take real-world action on the caller's instructions.
+- The scripted content is hard-constrained to never produce a genuine-looking credential, payment detail, or ID, and never a real military/infrastructure location or targeting information — see `voice-server/src/infraScript.ts`.
 
 ## Responsible-use boundaries
 
-ScamSink is a **defensive, inbound-only** honeypot. By design, this project does **not**:
+This is a **defensive simulation**, not a real engagement tool. By design, this project does **not**:
 
-- Place outbound calls or auto-dial anyone.
-- Scrape, buy, or otherwise acquire scam phone numbers.
+- Call any number that isn't explicitly on the server-side allowlist.
+- Scrape, buy, or otherwise acquire real phone numbers to call.
 - Spoof caller ID.
-- Impersonate a real, specific victim.
-- Use genuine financial, identity, or authentication information.
-- Attempt to extract passwords, card numbers, OTPs, seed phrases, or credentials from a caller.
-- Claim to have "prevented" any specific harm — only the time spent interacting with ScamSink is reported.
+- Impersonate a real, specific person, technician, supplier, or organization.
+- Use genuine financial, identity, or authentication information — every scripted detail (parts, drones, invoices, addresses) is deliberately generic and fictional.
+- Claim that a real adversary or real infrastructure personnel were contacted — only time diverted on consenting, allowlisted test numbers is reported.
 
 If a caller volunteers sensitive information unprompted, ScamSink does not repeat it back, store it verbatim where avoidable, or encourage further disclosure.
 
@@ -227,20 +228,12 @@ npm run test              # Next.js app (Vitest)
 cd voice-server && npm run test
 ```
 
-Covers, across both services: call lifecycle transitions and idempotent status-callback handling, transcript persistence and speaker validation, duration calculation, phone-number masking, sensitive-data redaction, Twilio/relay authentication (including malformed and forged requests), and AI-provider failure handling. All fixtures use synthetic phone numbers and synthetic data.
+Covers, across both services: call lifecycle transitions and idempotent status-callback handling, transcript persistence and speaker validation, duration calculation, phone-number masking and E.164 normalization, sensitive-data redaction, Twilio/relay authentication (including malformed and forged requests), the deterministic intent-classification and narrative-progression state machine (including regression tests for previously-reported contextual-mismatch bugs), TTS-timing estimation and the proactive-silence timer (including overlap/race prevention), and the safe-hangup path for unrecognized inbound calls. All fixtures use synthetic phone numbers and synthetic data.
 
 ## Known limitations
 
 - Redaction is a best-effort digit-run filter, not a real PII/PCI-grade system (see above).
 - Country-code detection in phone-number masking is a display heuristic, not real E.164 parsing.
-- The dashboard polls once per second rather than using a push channel — simple and reliable for a single-call MVP, but not infinitely scalable.
-- No automated integration test exercises a real Twilio call end-to-end (requires a live Twilio account and public URLs); this is verified manually against a real number.
-- Single active call at a time by design — see below.
-
-## Future work
-
-- Scam-number transfer/routing between multiple concurrent honeypot lines.
-- Richer scam-pattern classification and per-category personas.
-- Additional persona voices/personalities, selectable per number.
-- Aggregate, cross-call statistics.
-- A leaderboard / community participation layer (explicitly out of scope for this MVP).
+- The dashboard polls once per second rather than using a push channel — simple and reliable for this scale, but not infinitely scalable.
+- No automated integration test exercises a real Twilio call end-to-end (requires a live Twilio account and public URLs); this is verified manually against allowlisted test numbers.
+- Single active call at a time by design.

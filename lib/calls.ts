@@ -10,36 +10,23 @@ import type {
   Speaker,
 } from "./types";
 
+// The only demo mode the product creates going forward is
+// infrastructure_simulation, so callers of these lookups don't need
+// demo_mode at all to decide how to handle a call.
 export interface CallLookup {
   id: string;
   status: CallStatus;
-  demoMode: DemoMode | null;
-}
-
-interface CallLookupRow {
-  id: string;
-  status: CallStatus;
-  demo_mode: DemoMode | null;
-}
-
-function toCallLookup(row: CallLookupRow): CallLookup {
-  return { id: row.id, status: row.status, demoMode: row.demo_mode };
 }
 
 export async function getCallByTwilioSid(twilioCallSid: string): Promise<CallLookup | null> {
-  const row = await queryOne<CallLookupRow>(
-    `select id, status, demo_mode from calls where twilio_call_sid = $1`,
-    [twilioCallSid],
-  );
-  return row ? toCallLookup(row) : null;
+  return queryOne<CallLookup>(`select id, status from calls where twilio_call_sid = $1`, [twilioCallSid]);
 }
 
 /** Any call not yet completed/failed — used to stop a second demo call from being started concurrently. */
 export async function getActiveCall(): Promise<CallLookup | null> {
-  const row = await queryOne<CallLookupRow>(
-    `select id, status, demo_mode from calls where status in ('ringing', 'active') order by created_at desc limit 1`,
+  return queryOne<CallLookup>(
+    `select id, status from calls where status in ('ringing', 'active') order by created_at desc limit 1`,
   );
-  return row ? toCallLookup(row) : null;
 }
 
 /** Used to enforce a cooldown between demo call creations, regardless of outcome. */
@@ -195,45 +182,15 @@ async function fetchTranscript(callId: string): Promise<TranscriptRow[]> {
 }
 
 /**
- * Aggregate stats across every completed call, excluding infrastructure
- * simulation calls (those have their own getSimulationMetrics panel, so
- * they don't count toward "scammer time wasted"). Only 'completed' calls
- * count — a failed/never-connected call didn't waste any time and would
- * skew the average downward with a near-zero duration.
+ * Aggregate stats across completed infrastructure-simulation calls only.
+ * The scam-honeypot mode has been removed from the product, and legacy
+ * scam-demo rows left in the database from before that removal are
+ * deliberately excluded here — showing them as infrastructure-simulation
+ * activity would misrepresent what actually happened. Only 'completed'
+ * calls count — a failed/never-connected call didn't waste any time and
+ * would skew the average downward with a near-zero duration.
  */
 export async function getDashboardMetrics(): Promise<CallMetrics> {
-  const totals = await queryOne<{ total_calls: number; total_time_wasted_seconds: number }>(
-    `select
-       count(*) filter (where status = 'completed' and demo_mode is distinct from 'infrastructure_simulation')::int as total_calls,
-       coalesce(sum(duration_seconds) filter (where status = 'completed' and demo_mode is distinct from 'infrastructure_simulation'), 0)::int as total_time_wasted_seconds
-     from calls`,
-  );
-  const turnsRow = await queryOne<{ total_turns: number }>(
-    `select count(*)::int as total_turns
-     from transcript_messages tm
-     join calls c on c.id = tm.call_id
-     where c.status = 'completed' and tm.speaker != 'system'
-       and c.demo_mode is distinct from 'infrastructure_simulation'`,
-  );
-
-  const totalCalls = totals?.total_calls ?? 0;
-  const totalTimeWastedSeconds = totals?.total_time_wasted_seconds ?? 0;
-
-  return {
-    totalCalls,
-    totalTimeWastedSeconds,
-    averageCallSeconds: totalCalls > 0 ? Math.round(totalTimeWastedSeconds / totalCalls) : 0,
-    totalTurns: turnsRow?.total_turns ?? 0,
-  };
-}
-
-/**
- * Same shape as getDashboardMetrics, scoped to only completed
- * infrastructure-simulation calls — the "SIMULATED ADVERSARY TIME
- * DIVERTED" panel. Always derived from real completed_calls rows, never
- * faked; naturally all-zero until a real simulation call completes.
- */
-export async function getSimulationMetrics(): Promise<CallMetrics> {
   const totals = await queryOne<{ total_calls: number; total_time_wasted_seconds: number }>(
     `select
        count(*) filter (where status = 'completed')::int as total_calls,
@@ -247,39 +204,6 @@ export async function getSimulationMetrics(): Promise<CallMetrics> {
      join calls c on c.id = tm.call_id
      where c.status = 'completed' and tm.speaker != 'system'
        and c.demo_mode = 'infrastructure_simulation'`,
-  );
-
-  const totalCalls = totals?.total_calls ?? 0;
-  const totalTimeWastedSeconds = totals?.total_time_wasted_seconds ?? 0;
-
-  return {
-    totalCalls,
-    totalTimeWastedSeconds,
-    averageCallSeconds: totalCalls > 0 ? Math.round(totalTimeWastedSeconds / totalCalls) : 0,
-    totalTurns: turnsRow?.total_turns ?? 0,
-  };
-}
-
-/**
- * Same shape as getDashboardMetrics/getSimulationMetrics, scoped to only
- * completed scam_honeypot demo calls (excludes real inbound calls, which
- * still count toward the overall getDashboardMetrics total but aren't
- * attributed to this specific breakdown card).
- */
-export async function getScamHoneypotMetrics(): Promise<CallMetrics> {
-  const totals = await queryOne<{ total_calls: number; total_time_wasted_seconds: number }>(
-    `select
-       count(*) filter (where status = 'completed')::int as total_calls,
-       coalesce(sum(duration_seconds) filter (where status = 'completed'), 0)::int as total_time_wasted_seconds
-     from calls
-     where demo_mode = 'scam_honeypot'`,
-  );
-  const turnsRow = await queryOne<{ total_turns: number }>(
-    `select count(*)::int as total_turns
-     from transcript_messages tm
-     join calls c on c.id = tm.call_id
-     where c.status = 'completed' and tm.speaker != 'system'
-       and c.demo_mode = 'scam_honeypot'`,
   );
 
   const totalCalls = totals?.total_calls ?? 0;
@@ -348,23 +272,10 @@ export async function getDashboardState(): Promise<DashboardState> {
      limit 1`
   );
 
-  const [metrics, simulationMetrics, scamHoneypotMetrics, recentCalls] = await Promise.all([
-    getDashboardMetrics(),
-    getSimulationMetrics(),
-    getScamHoneypotMetrics(),
-    getRecentCalls(),
-  ]);
+  const [metrics, recentCalls] = await Promise.all([getDashboardMetrics(), getRecentCalls()]);
 
   if (!call) {
-    return {
-      call: null,
-      transcript: [],
-      metrics,
-      simulationMetrics,
-      scamHoneypotMetrics,
-      recentCalls,
-      serverTimeMs: Date.now(),
-    };
+    return { call: null, transcript: [], metrics, recentCalls, serverTimeMs: Date.now() };
   }
 
   const transcriptRows = await fetchTranscript(call.id);
@@ -373,8 +284,6 @@ export async function getDashboardState(): Promise<DashboardState> {
     call: toCallSnapshot(call),
     transcript: toTranscript(transcriptRows),
     metrics,
-    simulationMetrics,
-    scamHoneypotMetrics,
     recentCalls,
     serverTimeMs: Date.now(),
   };

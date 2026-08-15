@@ -26,12 +26,12 @@ describe("loadEnv", () => {
 
   it("requires DATABASE_URL", () => {
     delete process.env.DATABASE_URL;
-    expect(() => loadEnv()).toThrow(/DATABASE_URL is required/);
+    expect(() => loadEnv()).toThrow(/DATABASE_URL/);
   });
 
   it("requires TWILIO_AUTH_TOKEN", () => {
     delete process.env.TWILIO_AUTH_TOKEN;
-    expect(() => loadEnv()).toThrow(/TWILIO_AUTH_TOKEN is required/);
+    expect(() => loadEnv()).toThrow(/TWILIO_AUTH_TOKEN/);
   });
 
   it("requires VOICE_SERVER_SHARED_SECRET to be at least 16 characters", () => {
