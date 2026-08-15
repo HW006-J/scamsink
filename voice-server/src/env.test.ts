@@ -12,13 +12,6 @@ let originalEnv: NodeJS.ProcessEnv;
 
 beforeEach(() => {
   originalEnv = { ...process.env };
-  // Start from a clean slate so leftover ANTHROPIC_/GROQ_ vars from the
-  // real environment don't leak into these tests.
-  for (const key of Object.keys(process.env)) {
-    if (key.startsWith("GROQ_") || key.startsWith("ANTHROPIC_") || key === "AI_PROVIDER") {
-      delete process.env[key];
-    }
-  }
   Object.assign(process.env, BASE_ENV);
 });
 
@@ -27,61 +20,44 @@ afterEach(() => {
 });
 
 describe("loadEnv", () => {
-  it("defaults AI_PROVIDER to groq", () => {
-    process.env.GROQ_API_KEY = "gsk_test";
-    expect(loadEnv().AI_PROVIDER).toBe("groq");
-  });
-
-  it("defaults GROQ_MODEL to openai/gpt-oss-20b", () => {
-    process.env.GROQ_API_KEY = "gsk_test";
-    expect(loadEnv().GROQ_MODEL).toBe("openai/gpt-oss-20b");
-  });
-
-  it("requires GROQ_API_KEY when AI_PROVIDER=groq", () => {
-    process.env.AI_PROVIDER = "groq";
-    expect(() => loadEnv()).toThrow(/GROQ_API_KEY is required/);
-  });
-
-  it("does not require ANTHROPIC_API_KEY when AI_PROVIDER=groq", () => {
-    process.env.AI_PROVIDER = "groq";
-    process.env.GROQ_API_KEY = "gsk_test";
+  it("loads successfully with the required vars set", () => {
     expect(() => loadEnv()).not.toThrow();
   });
 
-  it("requires ANTHROPIC_API_KEY when AI_PROVIDER=anthropic", () => {
-    process.env.AI_PROVIDER = "anthropic";
-    expect(() => loadEnv()).toThrow(/ANTHROPIC_API_KEY is required/);
+  it("requires DATABASE_URL", () => {
+    delete process.env.DATABASE_URL;
+    expect(() => loadEnv()).toThrow(/DATABASE_URL is required/);
   });
 
-  it("does not require GROQ_API_KEY when AI_PROVIDER=anthropic", () => {
-    process.env.AI_PROVIDER = "anthropic";
-    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
-    expect(() => loadEnv()).not.toThrow();
-    expect(loadEnv().GROQ_API_KEY).toBeUndefined();
+  it("requires TWILIO_AUTH_TOKEN", () => {
+    delete process.env.TWILIO_AUTH_TOKEN;
+    expect(() => loadEnv()).toThrow(/TWILIO_AUTH_TOKEN is required/);
   });
 
-  it("accepts the anthropic provider explicitly with its key set", () => {
-    process.env.AI_PROVIDER = "anthropic";
-    process.env.ANTHROPIC_API_KEY = "sk-ant-test";
-    const env = loadEnv();
-    expect(env.AI_PROVIDER).toBe("anthropic");
-    expect(env.ANTHROPIC_MODEL).toBe("claude-haiku-4-5");
+  it("requires VOICE_SERVER_SHARED_SECRET to be at least 16 characters", () => {
+    process.env.VOICE_SERVER_SHARED_SECRET = "too-short";
+    expect(() => loadEnv()).toThrow(/VOICE_SERVER_SHARED_SECRET/);
   });
 
-  it("rejects an unknown AI_PROVIDER value", () => {
-    process.env.AI_PROVIDER = "openai";
-    process.env.GROQ_API_KEY = "gsk_test";
-    expect(() => loadEnv()).toThrow();
+  it("requires PUBLIC_APP_URL to be a valid URL", () => {
+    process.env.PUBLIC_APP_URL = "not-a-url";
+    expect(() => loadEnv()).toThrow(/PUBLIC_APP_URL must be a valid URL/);
   });
 
-  it("trims stray whitespace from GROQ_API_KEY (a common copy-paste artifact)", () => {
-    process.env.GROQ_API_KEY = "  gsk_test_with_padding \n";
-    expect(loadEnv().GROQ_API_KEY).toBe("gsk_test_with_padding");
+  it("defaults PORT to 8080", () => {
+    delete process.env.PORT;
+    expect(loadEnv().PORT).toBe(8080);
   });
 
   it("trims stray whitespace from VOICE_SERVER_SHARED_SECRET", () => {
-    process.env.GROQ_API_KEY = "gsk_test";
     process.env.VOICE_SERVER_SHARED_SECRET = "  a-very-long-shared-secret-value\n";
     expect(loadEnv().VOICE_SERVER_SHARED_SECRET).toBe("a-very-long-shared-secret-value");
+  });
+
+  it("no longer requires or references any AI provider configuration", () => {
+    const env = loadEnv();
+    expect(env).not.toHaveProperty("AI_PROVIDER");
+    expect(env).not.toHaveProperty("GROQ_API_KEY");
+    expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
   });
 });

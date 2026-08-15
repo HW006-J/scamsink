@@ -27,30 +27,21 @@ async function queryOne<T extends QueryResultRow = QueryResultRow>(
 
 export type CallStatus = "ringing" | "active" | "completed" | "failed";
 export type CallDirection = "inbound" | "outbound_demo";
-export type DemoMode = "scam_honeypot" | "infrastructure_simulation";
 export type Speaker = "caller" | "scamsink" | "system";
 
+// Any outbound_demo call is the infrastructure-simulation flow — that's the
+// only demo mode the product creates going forward, so the voice server
+// doesn't need to read demo_mode at all to decide how to handle a call.
 export interface CallLookup {
   id: string;
   status: CallStatus;
   direction: CallDirection;
-  demoMode: DemoMode | null;
-}
-
-interface CallLookupRow {
-  id: string;
-  status: CallStatus;
-  direction: CallDirection;
-  demo_mode: DemoMode | null;
 }
 
 export async function getCallByTwilioSid(twilioCallSid: string): Promise<CallLookup | null> {
-  const row = await queryOne<CallLookupRow>(
-    `select id, status, direction, demo_mode from calls where twilio_call_sid = $1`,
-    [twilioCallSid],
-  );
-  if (!row) return null;
-  return { id: row.id, status: row.status, direction: row.direction, demoMode: row.demo_mode };
+  return queryOne<CallLookup>(`select id, status, direction from calls where twilio_call_sid = $1`, [
+    twilioCallSid,
+  ]);
 }
 
 /** Idempotent: safe to call repeatedly for the same call. */
