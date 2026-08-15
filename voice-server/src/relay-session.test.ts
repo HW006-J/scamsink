@@ -406,7 +406,7 @@ describe("RelaySession — infrastructure simulation mode", () => {
     expect(recordCallEventMock).toHaveBeenCalledWith(
       "call-1",
       "infra_script_turn",
-      expect.objectContaining({ fromIndex: 1, toIndex: 2, matched: true }),
+      expect.objectContaining({ intent: "CAN_HELP", group: "help", usedBeat: false }),
     );
   });
 

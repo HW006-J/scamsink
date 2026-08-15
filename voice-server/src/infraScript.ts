@@ -12,6 +12,39 @@
  * "purchase order") — never a real military location, unit, weapons
  * specification, procurement credential, ID, payment detail, or
  * operational/targeting information.
+ *
+ * DESIGN NOTE — intent classification, not sequential state:
+ * An earlier version drove the response purely off "which numbered state
+ * are we in," classifying the human's utterance against only that state's
+ * keywords. That produced contextually wrong replies whenever the human
+ * paraphrased or asked something out of the expected order (e.g. asking
+ * about timing before confirming they'd help got answered with the
+ * invoice/paperwork beat, and a plain "sure, I can help" that didn't match
+ * the current state's narrow keywords got the generic "say that again"
+ * fallback — which itself sounds like confusion, compounding the problem).
+ *
+ * This version classifies every utterance into a fixed INTENT enum first,
+ * independent of any notion of "current position," and looks up a fixed
+ * response line for that intent's topic group. A topic that's already been
+ * covered doesn't repeat its line verbatim (which would sound robotic) —
+ * it serves the next varied delay beat instead. Only a genuinely
+ * unclassifiable ("OTHER") utterance touches the fallback path, and it
+ * never marks any topic as covered — the story only "advances" (a topic
+ * gets marked covered) when a real intent is recognized, or, after a
+ * deliberately designed repeated-fallback rule, by serving a delay beat
+ * instead of getting stuck.
+ *
+ * Classification here is deterministic keyword matching, which is
+ * sufficient for the enum below and keeps this path fully synchronous with
+ * zero network calls (the point of moving off Groq for this mode in the
+ * first place). The architecture leaves room for an optional Groq-based
+ * classifier later (never for generating the spoken line — only to map
+ * text to this same fixed enum), with a mandatory fall-through to this
+ * deterministic matcher on any failure/timeout/rate-limit, but that isn't
+ * wired in: the deterministic coverage below already resolves the
+ * reported contextual-mismatch issue, and adding a live network
+ * dependency to this reliability-critical path isn't worth it for the
+ * marginal cases it might additionally catch.
  */
 
 // Spoken automatically via Twilio's ConversationRelay welcomeGreeting as
@@ -21,27 +54,55 @@
 // same string and never drift apart.
 export const INFRA_OPENING_LINE = "Hi, I need some parts urgently to repair five drones. Can you help me with that?";
 
-export interface InfraScriptState {
-  /** Index of the next scripted line to speak once the human's utterance is accepted as matching. Starts at 1 — index 0 is the opening line, already spoken via welcomeGreeting. */
-  index: number;
-  fallbackStreak: number;
-}
+export const INFRA_INTENTS = [
+  "CAN_HELP",
+  "DELIVERY_OPTIONS",
+  "DELIVERY_TIMING",
+  "PAYMENT",
+  "INVOICE_OR_PURCHASE_ORDER",
+  "ASK_NAME",
+  "ASK_ADDRESS",
+  "ASK_DETAILS",
+  "CONFUSED",
+  "REPEAT_REQUEST",
+  "OTHER",
+] as const;
+export type InfraIntent = (typeof INFRA_INTENTS)[number];
 
-export const INITIAL_INFRA_SCRIPT_STATE: InfraScriptState = { index: 1, fallbackStreak: 0 };
+type ResponseGroup = "help" | "timing" | "invoice" | "details" | "repeat";
 
-export const INFRA_SCRIPT_FALLBACK_LINE =
-  "Sorry, could you say that again? I want to make sure I've got this right.";
+// Every intent except OTHER maps to exactly one topic group; several
+// intents deliberately share a group because the spec only calls for one
+// scripted line per topic area (e.g. PAYMENT and INVOICE_OR_PURCHASE_ORDER
+// both got a single combined "invoice" line in the original script).
+const INTENT_GROUP: Readonly<Partial<Record<InfraIntent, ResponseGroup>>> = {
+  CAN_HELP: "help",
+  DELIVERY_OPTIONS: "help",
+  DELIVERY_TIMING: "timing",
+  PAYMENT: "invoice",
+  INVOICE_OR_PURCHASE_ORDER: "invoice",
+  ASK_NAME: "details",
+  ASK_ADDRESS: "details",
+  ASK_DETAILS: "details",
+  CONFUSED: "repeat",
+  REPEAT_REQUEST: "repeat",
+};
 
-// Index 0 is a placeholder for INFRA_OPENING_LINE so state numbering lines
-// up 1:1 with the spec's STATE 1..5 — advanceInfraScript never speaks it.
-const CORE_LINES: readonly string[] = [
-  INFRA_OPENING_LINE,
-  "Great, thank you. One second — I had the delivery information written down somewhere. Could you tell me what delivery options you have while I find it?",
-  "It was definitely urgent. I think this afternoon... actually, hold on, I may be looking at tomorrow's schedule. What's the latest you could deliver today?",
-  "Yes, I think I need an invoice. Although someone here just told me it might need a purchase order first. Could you explain what information you normally need on that?",
-  "Of course. Give me one second — I've opened the wrong document. This appears to be my electricity bill.",
-  "Sorry about this. I definitely had the right document open a minute ago. Could you remind me what information you needed from me?",
-];
+const GROUP_LINE: Readonly<Record<ResponseGroup, string>> = {
+  help: "Great, thank you. One second — I had the delivery information written down somewhere. Could you tell me what delivery options you have while I find it?",
+  timing:
+    "It was definitely urgent. I think this afternoon... actually, hold on, I may be looking at tomorrow's schedule. What's the latest you could deliver today?",
+  invoice:
+    "Yes, I think I need an invoice. Although someone here just told me it might need a purchase order first. Could you explain what information you normally need on that?",
+  details: "Of course. Give me one second — I've opened the wrong document. This appears to be my electricity bill.",
+  repeat:
+    "Sorry about this. I definitely had the right document open a minute ago. Could you remind me what information you needed from me?",
+};
+
+// Used only for a genuinely unclassifiable ("OTHER") utterance — neutral
+// and non-committal, since (unlike CONFUSED/REPEAT_REQUEST) the human
+// wasn't necessarily confused, we just couldn't classify what they said.
+export const INFRA_OTHER_FALLBACK_LINE = "Sorry, one second — let me just note that down.";
 
 const DELAY_BEATS: readonly string[] = [
   "Sorry, I think I'm looking at the wrong page now — give me a second to find the right one.",
@@ -52,13 +113,6 @@ const DELAY_BEATS: readonly string[] = [
   "Sorry, I can't find my glasses and I can barely read this form without them.",
 ];
 
-/** Once past the scripted array, cycles through the delay beats forever rather than repeating earlier beats. */
-function lineForIndex(index: number): string {
-  if (index < CORE_LINES.length) return CORE_LINES[index];
-  const beatIndex = (index - CORE_LINES.length) % DELAY_BEATS.length;
-  return DELAY_BEATS[beatIndex];
-}
-
 function normalize(text: string): string {
   return text
     .toLowerCase()
@@ -67,26 +121,112 @@ function normalize(text: string): string {
     .trim();
 }
 
-// Keyword sets for the only states where the human's utterance genuinely
-// needs to say something specific to advance. Any index with no entry here
-// (1 — reply to the opener, and 5+ — "keep engaging") auto-advances on any
-// utterance instead — see isExpectedUtterance.
-const STATE_KEYWORDS: Readonly<Record<number, readonly string[]>> = {
-  2: ["what time", "when", "how urgent", "urgent", "how soon"],
-  3: ["invoice", "payment", "purchase order", "po number", "paperwork", "documentation", "pay"],
-  4: ["name", "address", "details", "company", "delivery destination", "where should", "who am i"],
-};
+/**
+ * Priority-ordered: more specific/narrow intents are checked before the
+ * broad, generic ones so e.g. "Sure, how urgent is it?" classifies as
+ * DELIVERY_TIMING rather than the generic affirmative CAN_HELP swallowing
+ * it. CONFUSED/REPEAT_REQUEST are checked first since a real "sorry,
+ * what?" should never be mistaken for topic content.
+ */
+function classifyIntent(normalizedText: string): InfraIntent {
+  const has = (phrase: string) => normalizedText.includes(phrase);
+  const hasAny = (phrases: readonly string[]) => phrases.some(has);
 
-function isExpectedUtterance(index: number, normalizedText: string): boolean {
-  const keywords = STATE_KEYWORDS[index];
-  if (!keywords) return true;
-  return keywords.some((phrase) => normalizedText.includes(phrase));
+  if (normalizedText === "what" || normalizedText === "sorry" || normalizedText === "eh" || normalizedText === "huh") {
+    return "CONFUSED";
+  }
+  if (hasAny(["sorry", "pardon", "excuse me", "beg your", "didnt catch", "didnt hear", "what was that"])) {
+    return "CONFUSED";
+  }
+  if (hasAny(["come again", "say that again", "repeat that", "one more time", "can you repeat"])) {
+    return "REPEAT_REQUEST";
+  }
+  if (
+    hasAny([
+      "how urgent",
+      "urgent",
+      "what time",
+      "when do you need",
+      "when",
+      "how soon",
+      "whats the rush",
+      "timeline",
+      "deadline",
+      "how quickly",
+    ])
+  ) {
+    return "DELIVERY_TIMING";
+  }
+  if (hasAny(["how are you paying", "how will you pay", "how will i be paid", "payment", "pay you", "get paid"])) {
+    return "PAYMENT";
+  }
+  if (hasAny(["invoice", "purchase order", "po number", "paperwork", "documentation"])) {
+    return "INVOICE_OR_PURCHASE_ORDER";
+  }
+  if (hasAny(["your name", "who am i", "who is this", "whos this", "speaking to"])) {
+    return "ASK_NAME";
+  }
+  if (
+    hasAny([
+      "address",
+      "where do i send",
+      "where should i deliver",
+      "where are you based",
+      "delivery destination",
+      "where are you located",
+      "your location",
+    ])
+  ) {
+    return "ASK_ADDRESS";
+  }
+  if (hasAny(["your details", "company information", "company details", "more information", "more details", "tell me more"])) {
+    return "ASK_DETAILS";
+  }
+  if (hasAny(["delivery option", "delivery method", "how do you want it delivered", "courier", "shipping method"])) {
+    return "DELIVERY_OPTIONS";
+  }
+  if (
+    hasAny([
+      "yes",
+      "sure",
+      "of course",
+      "okay",
+      "ok",
+      "sounds good",
+      "no problem",
+      "definitely",
+      "absolutely",
+      "certainly",
+      "i can help",
+      "happy to help",
+      "can do",
+    ])
+  ) {
+    return "CAN_HELP";
+  }
+  return "OTHER";
 }
 
+export interface InfraScriptState {
+  /** Topic groups whose scripted line has already been spoken once verbatim. */
+  coveredGroups: ReadonlySet<ResponseGroup>;
+  /** Next delay beat to serve, for repeated topics and forced-progress fallbacks. */
+  beatIndex: number;
+  /** Consecutive unclassifiable (OTHER) utterances. */
+  fallbackStreak: number;
+}
+
+export const INITIAL_INFRA_SCRIPT_STATE: InfraScriptState = {
+  coveredGroups: new Set(),
+  beatIndex: 0,
+  fallbackStreak: 0,
+};
+
 export interface InfraScriptTransition {
-  fromIndex: number;
-  toIndex: number;
-  matched: boolean;
+  intent: InfraIntent;
+  group: ResponseGroup | null;
+  /** True when a delay beat was served instead of a topic's first-time line (either a repeated topic, or a forced-progress fallback). */
+  usedBeat: boolean;
 }
 
 export interface InfraScriptResult {
@@ -95,31 +235,64 @@ export interface InfraScriptResult {
   transition: InfraScriptTransition;
 }
 
-// One fallback reply is allowed at a given state before forcing progress —
-// this is what guarantees the simulation can never get stuck in place.
+// One fallback reply is allowed before forcing progress via a delay beat —
+// this is what guarantees the simulation can never get stuck in place,
+// without ever pretending to understand something it didn't.
 const MAX_FALLBACK_STREAK = 1;
+
+function nextBeat(state: InfraScriptState): string {
+  return DELAY_BEATS[state.beatIndex % DELAY_BEATS.length];
+}
 
 /**
  * Pure, synchronous, and total: for any state and any input string
  * (including empty/garbage), this always returns a non-empty line and a
- * valid next state. Never throws.
+ * valid next state. Never throws. Responds sensibly to out-of-order
+ * questions — a recognized intent always gets its topic's line regardless
+ * of what's been covered so far.
  */
 export function advanceInfraScript(state: InfraScriptState, humanText: string): InfraScriptResult {
   const normalized = normalize(humanText ?? "");
-  const matched = isExpectedUtterance(state.index, normalized);
+  const intent = classifyIntent(normalized);
+  const group = INTENT_GROUP[intent] ?? null;
 
-  if (matched || state.fallbackStreak >= MAX_FALLBACK_STREAK) {
-    const toIndex = state.index + 1;
+  if (group) {
+    const alreadyCovered = state.coveredGroups.has(group);
+    if (!alreadyCovered) {
+      return {
+        line: GROUP_LINE[group],
+        nextState: {
+          coveredGroups: new Set(state.coveredGroups).add(group),
+          beatIndex: state.beatIndex,
+          fallbackStreak: 0,
+        },
+        transition: { intent, group, usedBeat: false },
+      };
+    }
     return {
-      line: lineForIndex(state.index),
-      nextState: { index: toIndex, fallbackStreak: 0 },
-      transition: { fromIndex: state.index, toIndex, matched },
+      line: nextBeat(state),
+      nextState: { coveredGroups: state.coveredGroups, beatIndex: state.beatIndex + 1, fallbackStreak: 0 },
+      transition: { intent, group, usedBeat: true },
+    };
+  }
+
+  // Unrecognized (OTHER): never marks a topic covered. One neutral
+  // fallback is allowed before a deliberate forced-progress delay beat.
+  if (state.fallbackStreak >= MAX_FALLBACK_STREAK) {
+    return {
+      line: nextBeat(state),
+      nextState: { coveredGroups: state.coveredGroups, beatIndex: state.beatIndex + 1, fallbackStreak: 0 },
+      transition: { intent: "OTHER", group: null, usedBeat: true },
     };
   }
 
   return {
-    line: INFRA_SCRIPT_FALLBACK_LINE,
-    nextState: { index: state.index, fallbackStreak: state.fallbackStreak + 1 },
-    transition: { fromIndex: state.index, toIndex: state.index, matched: false },
+    line: INFRA_OTHER_FALLBACK_LINE,
+    nextState: {
+      coveredGroups: state.coveredGroups,
+      beatIndex: state.beatIndex,
+      fallbackStreak: state.fallbackStreak + 1,
+    },
+    transition: { intent: "OTHER", group: null, usedBeat: false },
   };
 }

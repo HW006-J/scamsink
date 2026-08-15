@@ -16,7 +16,7 @@ import {
 } from "./demoScript.js";
 import {
   advanceInfraScript,
-  INFRA_SCRIPT_FALLBACK_LINE,
+  INFRA_OTHER_FALLBACK_LINE,
   INITIAL_INFRA_SCRIPT_STATE,
   type InfraScriptState,
 } from "./infraScript.js";
@@ -247,14 +247,14 @@ export class RelaySession {
       line = result.line;
       if (this.callId) {
         await recordCallEvent(this.callId, "infra_script_turn", {
-          fromIndex: result.transition.fromIndex,
-          toIndex: result.transition.toIndex,
-          matched: result.transition.matched,
+          intent: result.transition.intent,
+          group: result.transition.group,
+          usedBeat: result.transition.usedBeat,
         }).catch(() => {});
       }
     } catch (err) {
       console.error("[relay] infra script state machine failed, using safe fallback:", err);
-      line = INFRA_SCRIPT_FALLBACK_LINE;
+      line = INFRA_OTHER_FALLBACK_LINE;
     }
 
     if (this.closed || generation !== this.generation) return;
